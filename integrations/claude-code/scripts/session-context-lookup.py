@@ -187,8 +187,8 @@ async def _run(prompt: str, out_stream=None):
     # so this file is the source of truth for "what did the plugin give
     # Claude on prompt X."
     try:
-        from datetime import datetime as _dt, timezone as _tz
         from pathlib import Path as _Path
+        from datetime import datetime as _dt, timezone as _tz
 
         _audit = _Path.home() / ".cognee-plugin" / "recall-audit.log"
         _audit.parent.mkdir(parents=True, exist_ok=True)
