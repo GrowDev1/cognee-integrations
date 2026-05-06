@@ -306,6 +306,19 @@ async def _ensure_identity_via_sdk() -> str:
 
 
 _RESOLVED_CACHE_PATH = Path.home() / ".cognee-plugin" / "resolved.json"
+_LOCAL_SETUP_DONE = False
+
+
+async def _ensure_local_databases() -> None:
+    """Create Cognee's local relational/vector stores for SDK mode."""
+    global _LOCAL_SETUP_DONE
+    if _LOCAL_SETUP_DONE:
+        return
+
+    from cognee.modules.engine.operations.setup import setup
+
+    await setup()
+    _LOCAL_SETUP_DONE = True
 
 
 async def ensure_cognee_ready(config: dict) -> None:
@@ -314,6 +327,10 @@ async def ensure_cognee_ready(config: dict) -> None:
     In cloud mode, loads the cached API key from resolved.json (written
     by SessionStart) so that hooks running in separate processes can
     authenticate against the server.
+
+    In local SDK mode, also runs Cognee's setup() so a fresh machine or
+    fresh virtualenv has its databases/tables before identity, recall, or
+    session writes touch them.
     """
     import cognee
 
@@ -332,10 +349,15 @@ async def ensure_cognee_ready(config: dict) -> None:
             kwargs["api_key"] = api_key
         await cognee.serve(**kwargs)
         print(f"cognee-plugin: connected to {url}", file=sys.stderr)
-    elif config.get("llm_api_key"):
+        return
+
+    if config.get("llm_api_key"):
         cognee.config.set_llm_api_key(config["llm_api_key"])
-        if config.get("llm_model"):
-            cognee.config.set_llm_model(config["llm_model"])
+    if config.get("llm_model"):
+        cognee.config.set_llm_model(config["llm_model"])
+
+    await _ensure_local_databases()
+    print("cognee-plugin: local databases ready", file=sys.stderr)
 
 
 def _get_git_branch(cwd: str) -> str:

@@ -121,15 +121,16 @@ async def _run(prompt: str, out_stream=None):
     # Best-effort; failure here must not break the hook output.
     try:
         from pathlib import Path as _Path
+
         _state = _Path.home() / ".cognee-plugin" / "last_recall.json"
         _state.parent.mkdir(parents=True, exist_ok=True)
         _state.write_text(
             json.dumps(
                 {
                     "session_id": session_id,
-                    "ts": __import__("datetime").datetime.now(
-                        __import__("datetime").timezone.utc
-                    ).isoformat(timespec="seconds"),
+                    "ts": __import__("datetime")
+                    .datetime.now(__import__("datetime").timezone.utc)
+                    .isoformat(timespec="seconds"),
                     "hits": counts,
                     "saves_last_turn": saves_last_turn,
                 }
@@ -186,8 +187,10 @@ async def _run(prompt: str, out_stream=None):
     # so this file is the source of truth for "what did the plugin give
     # Claude on prompt X."
     try:
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         from pathlib import Path as _Path
+
         _audit = _Path.home() / ".cognee-plugin" / "recall-audit.log"
         _audit.parent.mkdir(parents=True, exist_ok=True)
         with _audit.open("a", encoding="utf-8") as fh:

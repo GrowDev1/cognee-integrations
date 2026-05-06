@@ -118,7 +118,9 @@ def bump_save_counter(session_id: str, kind: str) -> None:
     if not session_id or kind not in SAVE_KINDS:
         return
     try:
-        data = json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
+        data = (
+            json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
+        )
     except Exception:
         data = {}
     sess = data.get(session_id) or {k: 0 for k in SAVE_KINDS}
@@ -137,7 +139,9 @@ def read_and_reset_save_counter(session_id: str) -> dict:
     if not session_id:
         return zero
     try:
-        data = json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
+        data = (
+            json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
+        )
     except Exception:
         return zero
     sess = data.get(session_id) or zero
