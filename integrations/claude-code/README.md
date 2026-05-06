@@ -123,6 +123,45 @@ Three skills are available as slash commands:
 - **`/cognee-memory:cognee-search`** — explicitly search session or graph memory, optionally filtered by category. Automatic search happens on every prompt via hooks.
 - **`/cognee-memory:cognee-sync`** — force-sync session data to the permanent graph without waiting for session end
 
+## Status line (optional)
+
+Adds a one-line status display at the bottom of your terminal showing cognee mode/dataset/session, recall hit counts from the most recent prompt, and saves accumulated for the current turn.
+
+The script ships in the plugin at `scripts/cognee-statusline.sh`. Claude Code's `statusLine` setting is per-user, so you wire it into `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/cognee-integrations/integrations/claude-code/scripts/cognee-statusline.sh"
+  }
+}
+```
+
+Example output:
+
+```
+cognee[local] ds=claude_sessions sess=74f2b7ad530a | 🔍 recall: 5s/5t/1g | saving: 1p/0t/1a
+```
+
+The script reads three small JSON state files written by the plugin:
+
+| File | Source | Surfaces |
+|---|---|---|
+| `~/.cognee-plugin/resolved.json` | SessionStart hook | mode, dataset, short session id |
+| `~/.cognee-plugin/last_recall.json` | UserPromptSubmit hook | session/trace/graph_context hit counts |
+| `~/.cognee-plugin/save_counter.json` | per-turn save hooks | prompt/trace/answer save counts (resets each prompt) |
+
+Any missing piece is silently omitted, so the line stays short on idle turns.
+
+## Audit log
+
+The UserPromptSubmit hook also appends a JSONL entry per prompt to `~/.cognee-plugin/recall-audit.log`, recording the timestamp, session_id, prompt text, hit counts, and the full `additionalContext` injected into Claude's input. This is the source of truth for "what did the plugin give Claude on prompt X" — Claude Code does not persist hook `additionalContext` into its JSONL transcript.
+
+```bash
+tail -n 1 ~/.cognee-plugin/recall-audit.log | jq -r .context
+```
+
 ## Configuration reference
 
 | Key | Env var | Default | Description |
@@ -134,6 +173,6 @@ Three skills are available as slash commands:
 | `api_key` | `COGNEE_API_KEY` | -- | Cognee Cloud API key |
 | `llm_api_key` | `LLM_API_KEY` | -- | LLM provider key (local mode) |
 | `llm_model` | `LLM_MODEL` | -- | LLM model name (local mode) |
-| `top_k` | -- | `3` | Results returned by automatic session search |
+| `top_k` | -- | `5` | Results returned by automatic session search (per scope) |
 
 Config is resolved in order: env vars > `~/.cognee-plugin/config.json` > defaults.

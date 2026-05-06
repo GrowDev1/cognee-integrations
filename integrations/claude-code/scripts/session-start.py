@@ -122,7 +122,7 @@ def _write_resolved(
     _RESOLVED_CACHE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-async def _start():
+async def _start(out_stream=None):
     config = load_config()
     cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
 
@@ -186,17 +186,26 @@ async def _start():
             ),
         }
     }
-    print(json.dumps(guidance))
+    print(json.dumps(guidance), file=out_stream or sys.stdout)
 
 
 def main():
     # Read stdin (SessionStart payload) — consumed but not used
     sys.stdin.read()
 
+    # Claude Code expects pure JSON on stdout for hookSpecificOutput. Some
+    # cognee codepaths print human-facing banners directly to stdout, which
+    # would contaminate the hook output and prevent systemMessage from
+    # rendering in the user's terminal. Redirect stdout to stderr while we
+    # run, then write our JSON to the saved real stdout at the very end.
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
     try:
-        asyncio.run(_start())
+        asyncio.run(_start(real_stdout))
     except Exception as exc:
         print(f"cognee-plugin: session start failed ({exc})", file=sys.stderr)
+    finally:
+        sys.stdout = real_stdout
 
 
 if __name__ == "__main__":
