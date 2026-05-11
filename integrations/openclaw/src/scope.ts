@@ -103,16 +103,25 @@ export function routeFileToScope(
 
 /**
  * Determine whether multi-scope mode is active.
- * Active when at least one scope-specific dataset prefix/name is configured.
+ * Active when at least one scope-specific dataset prefix/name/template is configured.
  */
 export function isMultiScopeEnabled(cfg: Required<CogneePluginConfig>): boolean {
-  return !!(cfg.companyDataset || cfg.userDatasetPrefix || cfg.agentDatasetPrefix);
+  return !!(cfg.companyDataset || cfg.userDatasetPrefix || cfg.agentDatasetPrefix || cfg.agentDatasetTemplate);
 }
 
 /**
  * Resolve the Cognee dataset name for a given memory scope.
+ *
+ * `runtimeAgentId` lets multi-agent gateways pass the active agent's identity
+ * (from PluginHookAgentContext.agentId) so the "agent" scope routes to the
+ * caller's dataset rather than the static plugin-config agentId. Falls back to
+ * cfg.agentId when runtimeAgentId is absent (CLI / background sync paths).
  */
-export function datasetNameForScope(scope: MemoryScope, cfg: Required<CogneePluginConfig>): string {
+export function datasetNameForScope(
+  scope: MemoryScope,
+  cfg: Required<CogneePluginConfig>,
+  runtimeAgentId?: string,
+): string {
   switch (scope) {
     case "company":
       return cfg.companyDataset || `${cfg.datasetName}-company`;
@@ -120,9 +129,14 @@ export function datasetNameForScope(scope: MemoryScope, cfg: Required<CogneePlug
       return cfg.userDatasetPrefix
         ? `${cfg.userDatasetPrefix}-${cfg.userId || "default"}`
         : `${cfg.datasetName}-user-${cfg.userId || "default"}`;
-    case "agent":
+    case "agent": {
+      const id = runtimeAgentId?.trim() || cfg.agentId || "default";
+      if (cfg.agentDatasetTemplate) {
+        return cfg.agentDatasetTemplate.replace(/\{agentId\}/g, id);
+      }
       return cfg.agentDatasetPrefix
-        ? `${cfg.agentDatasetPrefix}-${cfg.agentId || "default"}`
-        : `${cfg.datasetName}-agent-${cfg.agentId || "default"}`;
+        ? `${cfg.agentDatasetPrefix}-${id}`
+        : `${cfg.datasetName}-agent-${id}`;
+    }
   }
 }

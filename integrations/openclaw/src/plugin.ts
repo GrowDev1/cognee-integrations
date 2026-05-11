@@ -92,14 +92,16 @@ const memoryCogneePlugin = {
     ]);
 
     // Fix #8: Log when scopes have no dataset ID during recall
-    async function getRecallDatasetIds(): Promise<{ ids: string[]; missingScopes: string[] }> {
+    async function getRecallDatasetIds(
+      runtimeAgentId?: string,
+    ): Promise<{ ids: string[]; missingScopes: string[] }> {
       const state = await loadDatasetState();
       const ids: string[] = [];
       const missingScopes: string[] = [];
 
       if (multiScope) {
         for (const scope of cfg.recallScopes) {
-          const dsName = datasetNameForScope(scope, cfg);
+          const dsName = datasetNameForScope(scope, cfg, runtimeAgentId);
           const dsId = state[dsName] ?? scopedIndexes[scope]?.datasetId;
           if (dsId) {
             ids.push(dsId);
@@ -390,7 +392,7 @@ const memoryCogneePlugin = {
           return;
         }
 
-        const { ids: recallDatasetIds, missingScopes } = await getRecallDatasetIds();
+        const { ids: recallDatasetIds, missingScopes } = await getRecallDatasetIds(ctx.agentId);
 
         // Fix #8: Log missing scopes so users know what's not being searched
         if (missingScopes.length > 0) {
@@ -408,7 +410,7 @@ const memoryCogneePlugin = {
             const state = await loadDatasetState();
 
             const searchPromises = cfg.recallScopes.map(async (scope): Promise<{ scope: MemoryScope; results: CogneeSearchResult[] } | null> => {
-              const dsName = datasetNameForScope(scope, cfg);
+              const dsName = datasetNameForScope(scope, cfg, ctx.agentId);
               const dsId = state[dsName] ?? scopedIndexes[scope]?.datasetId;
               if (!dsId) return null;
 
@@ -516,7 +518,7 @@ const memoryCogneePlugin = {
             const targetDatasetIds: string[] = [];
             if (multiScope) {
               const state = await loadDatasetState();
-              const agentDsName = datasetNameForScope("agent", cfg);
+              const agentDsName = datasetNameForScope("agent", cfg, ctx.agentId);
               const agentDsId = state[agentDsName] ?? scopedIndexes.agent?.datasetId;
               if (agentDsId) targetDatasetIds.push(agentDsId);
             } else if (datasetId) {

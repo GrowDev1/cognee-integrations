@@ -85,6 +85,7 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
   const companyDataset = raw.companyDataset?.trim() || "";
   const userDatasetPrefix = raw.userDatasetPrefix?.trim() || "";
   const agentDatasetPrefix = raw.agentDatasetPrefix?.trim() || "";
+  const agentDatasetTemplate = raw.agentDatasetTemplate?.trim() || "";
   const userId = raw.userId?.trim() || process.env.OPENCLAW_USER_ID || "";
   const agentId = raw.agentId?.trim() || process.env.OPENCLAW_AGENT_ID || "default";
   const recallScopes = Array.isArray(raw.recallScopes) ? raw.recallScopes : DEFAULT_RECALL_SCOPES;
@@ -103,7 +104,7 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
 
   return {
     mode, baseUrl, apiKey, username, password, datasetName,
-    companyDataset, userDatasetPrefix, agentDatasetPrefix, userId, agentId,
+    companyDataset, userDatasetPrefix, agentDatasetPrefix, agentDatasetTemplate, userId, agentId,
     recallScopes, defaultWriteScope, scopeRouting,
     recallInjectionPosition,
     enableSessions, persistSessionsAfterEnd,
