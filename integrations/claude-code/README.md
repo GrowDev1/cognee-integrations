@@ -154,6 +154,19 @@ The script reads three small JSON state files written by the plugin:
 
 Any missing piece is silently omitted, so the line stays short on idle turns.
 
+## Auto-clear demo hook
+
+For demos where each response should leave Claude with an empty transcript context, enable the Stop-hook clear path:
+
+```bash
+export COGNEE_CLAUDE_CLEAR_AFTER_MESSAGE=true
+claude --plugin-dir /path/to/cognee-integrations/integrations/claude-code
+```
+
+When enabled, the plugin's `Stop` hook empties Claude Code's `transcript_path` after each assistant response. Memory capture runs first, so the response can still be stored in Cognee before the local Claude context is deleted.
+
+This is a demo-only workaround. Claude Code hooks do not expose a supported action for executing built-in slash commands like `/clear`, so the hook clears the backing transcript file directly.
+
 ## Audit log
 
 The UserPromptSubmit hook also appends a JSONL entry per prompt to `~/.cognee-plugin/recall-audit.log`, recording the timestamp, session_id, prompt text, hit counts, and the full `additionalContext` injected into Claude's input. This is the source of truth for "what did the plugin give Claude on prompt X" — Claude Code does not persist hook `additionalContext` into its JSONL transcript.
@@ -173,6 +186,7 @@ tail -n 1 ~/.cognee-plugin/recall-audit.log | jq -r .context
 | `api_key` | `COGNEE_API_KEY` | -- | Cognee Cloud API key |
 | `llm_api_key` | `LLM_API_KEY` | -- | LLM provider key (local mode) |
 | `llm_model` | `LLM_MODEL` | -- | LLM model name (local mode) |
+| demo auto-clear | `COGNEE_CLAUDE_CLEAR_AFTER_MESSAGE` | disabled | When truthy, empties Claude transcript context after each assistant response |
 | `top_k` | -- | `5` | Results returned by automatic session search (per scope) |
 
 Config is resolved in order: env vars > `~/.cognee-plugin/config.json` > defaults.

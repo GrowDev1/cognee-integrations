@@ -48,6 +48,12 @@
             "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store-to-session.py --stop",
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/clear-transcript-context.py",
+            "timeout": 5,
+            "statusMessage": "Clearing Claude context..."
           }
         ]
       }
