@@ -48,6 +48,16 @@ export type CogneePluginConfig = {
   companyDataset?: string;
   userDatasetPrefix?: string;
   agentDatasetPrefix?: string;
+  /**
+   * Template for the per-agent dataset name. Use `{agentId}` as the placeholder.
+   * Examples:
+   *   "{agentId}"               → bare agent id ("research", "ebay")
+   *   "memory-{agentId}"        → "memory-research"
+   * When set, takes precedence over `agentDatasetPrefix` and the legacy
+   * `${datasetName}-agent-{id}` fallback. Multi-agent gateways should set this
+   * to align with how their per-agent datasets are named in Cognee.
+   */
+  agentDatasetTemplate?: string;
   userId?: string;
   agentId?: string;
   recallScopes?: MemoryScope[];
