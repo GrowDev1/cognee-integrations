@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import type { CogneeAddResponse, CogneeDeleteMode, CogneeMode, CogneeRememberItem, CogneeRememberResponse, CogneeSearchResult, CogneeSearchType } from "./types.js";
+import type {
+  CogneeAddResponse,
+  CogneeDeleteMode,
+  CogneeMode,
+  CogneeRememberItem,
+  CogneeRememberResponse,
+  CogneeSearchResult,
+  CogneeSearchType,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Constants

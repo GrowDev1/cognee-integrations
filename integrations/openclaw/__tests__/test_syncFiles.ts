@@ -84,6 +84,7 @@ function baseCfg(overrides: Partial<CogneePluginConfig> = {}): Required<CogneePl
     autoIndex: true,
     autoCognify: true,
     autoMemify: false,
+    improveOnSessionEnd: true,
     requestTimeoutMs: 30000,
     ingestionTimeoutMs: 300000,
     ...overrides,
