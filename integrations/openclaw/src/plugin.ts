@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { CogneeSearchResult, MemoryScope, ScopedSyncIndexes, SyncIndex } from "./types.js";
 import { MEMORY_SCOPES } from "./types.js";
@@ -48,12 +47,16 @@ const memoryCogneePlugin = {
 
     // Session state
     let sessionId: string | undefined;
+    // Cached because session_end fires without ctx.
+    let lastAgentId: string | undefined;
 
     let resolvedWorkspaceDir: string | undefined;
     let resolveServiceReady: (() => void) | undefined;
     const serviceReady = new Promise<void>((r) => { resolveServiceReady = r; });
 
-    // Load persisted state on startup
+    // Hoisted so CLI processes can suppress the gateway's auto-sync timer.
+    let autoSyncStarted = false;
+
     const stateReady = Promise.all([
       loadDatasetState()
         .then((state) => {
@@ -94,14 +97,16 @@ const memoryCogneePlugin = {
     ]);
 
     // Fix #8: Log when scopes have no dataset ID during recall
-    async function getRecallDatasetIds(): Promise<{ ids: string[]; missingScopes: string[] }> {
+    async function getRecallDatasetIds(
+      runtimeAgentId?: string,
+    ): Promise<{ ids: string[]; missingScopes: string[] }> {
       const state = await loadDatasetState();
       const ids: string[] = [];
       const missingScopes: string[] = [];
 
       if (multiScope) {
         for (const scope of cfg.recallScopes) {
-          const dsName = datasetNameForScope(scope, cfg);
+          const dsName = datasetNameForScope(scope, cfg, runtimeAgentId);
           const dsId = state[dsName] ?? scopedIndexes[scope]?.datasetId;
           if (dsId) {
             ids.push(dsId);
@@ -116,8 +121,11 @@ const memoryCogneePlugin = {
       return { ids, missingScopes };
     }
 
-    // Helper: run sync
-    async function runSync(workspaceDir: string, logger: { info?: (msg: string) => void; warn?: (msg: string) => void }) {
+    async function runSync(
+      workspaceDir: string,
+      logger: { info?: (msg: string) => void; warn?: (msg: string) => void },
+      runtimeAgentId?: string,
+    ) {
       await stateReady;
 
       const files = await collectMemoryFiles(workspaceDir);
@@ -129,7 +137,7 @@ const memoryCogneePlugin = {
       logger.info?.(`cognee-openclaw: found ${files.length} memory file(s), syncing...`);
 
       if (multiScope) {
-        return syncFilesScoped(client, files, files, scopedIndexes, cfg, logger);
+        return syncFilesScoped(client, files, files, scopedIndexes, cfg, logger, runtimeAgentId);
       } else {
         const result = await syncFiles(client, files, files, syncIndex, cfg, logger);
         if (result.datasetId) datasetId = result.datasetId;
@@ -192,6 +200,8 @@ const memoryCogneePlugin = {
     api.registerCli((ctx) => {
       const cognee = ctx.program.command("cognee").description("Cognee memory management");
       const cliWorkspaceDir = ctx.workspaceDir || process.cwd();
+
+      autoSyncStarted = true;
 
       cognee
         .command("index")
@@ -405,6 +415,26 @@ const memoryCogneePlugin = {
           console.log(`Forget failed: ${result.error ?? "unknown error"}`);
           process.exit(1);
         });
+
+      cognee
+        .command("improve")
+        .description("Bridge session-cache QAs (and any feedback) into the permanent graph. With --session-id, scopes to that session; otherwise improves the dataset in general.")
+        .option("--session-id <id>", "Session to bridge")
+        .option("--dataset <name>", "Dataset name (default: configured datasetName)")
+        .action(async (opts: { sessionId?: string; dataset?: string }) => {
+          const dsName = opts.dataset ?? (multiScope ? datasetNameForScope("agent", cfg) : cfg.datasetName);
+          try {
+            const result = await client.improve({
+              datasetName: dsName,
+              ...(opts.sessionId ? { sessionIds: [opts.sessionId] } : {}),
+            });
+            console.log(`Improve dispatched for dataset "${dsName}"${opts.sessionId ? ` (sessionId=${opts.sessionId})` : ""} — status=${result.status ?? "?"}`);
+            process.exit(0);
+          } catch (error) {
+            console.log(`Improve failed: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+          }
+        });
     }, { commands: ["cognee"] });
 
     // ------------------------------------------------------------------
@@ -412,8 +442,6 @@ const memoryCogneePlugin = {
     // ------------------------------------------------------------------
 
     if (cfg.autoIndex) {
-      let autoSyncStarted = false;
-
       const runAutoSync = async (workspaceDir?: string) => {
         if (autoSyncStarted) return;
         autoSyncStarted = true;
@@ -428,11 +456,6 @@ const memoryCogneePlugin = {
         } catch (error) {
           logger.warn?.(`cognee-openclaw: Cognee API unreachable at ${cfg.baseUrl} — auto-sync disabled for this session. Error: ${String(error)}`);
           return;
-        }
-
-        if (cfg.enableSessions && !sessionId) {
-          sessionId = `openclaw-${randomUUID()}`;
-          logger.info?.(`cognee-openclaw: session ${sessionId}`);
         }
 
         try {
@@ -475,12 +498,15 @@ const memoryCogneePlugin = {
       api.on("before_prompt_build", async (event, ctx) => {
         await stateReady;
 
+        // session_start isn't fired in every openclaw flow; sync from ctx on every hook.
+        if (cfg.enableSessions && ctx.sessionId) sessionId = ctx.sessionId;
+
         if (!event.prompt || event.prompt.length < 5) {
           api.logger.debug?.("cognee-openclaw: skipping recall (prompt too short)");
           return;
         }
 
-        const { ids: recallDatasetIds, missingScopes } = await getRecallDatasetIds();
+        const { ids: recallDatasetIds, missingScopes } = await getRecallDatasetIds(ctx.agentId);
 
         // Fix #8: Log missing scopes so users know what's not being searched
         if (missingScopes.length > 0) {
@@ -498,7 +524,7 @@ const memoryCogneePlugin = {
             const state = await loadDatasetState();
 
             const searchPromises = cfg.recallScopes.map(async (scope): Promise<{ scope: MemoryScope; results: CogneeSearchResult[] } | null> => {
-              const dsName = datasetNameForScope(scope, cfg);
+              const dsName = datasetNameForScope(scope, cfg, ctx.agentId);
               const dsId = state[dsName] ?? scopedIndexes[scope]?.datasetId;
               if (!dsId) return null;
 
@@ -597,49 +623,16 @@ const memoryCogneePlugin = {
         if (!event.success) return;
         await Promise.all([stateReady, serviceReady]);
 
+        lastAgentId = ctx.agentId;
+        if (cfg.enableSessions && ctx.sessionId) sessionId = ctx.sessionId;
+
         const workspaceDir = resolvedWorkspaceDir!;
 
-        // Fix #4: Actually persist the session into the knowledge graph
-        if (cfg.enableSessions && cfg.persistSessionsAfterEnd && sessionId) {
-          try {
-            // Determine target dataset for session persistence
-            const targetDatasetIds: string[] = [];
-            if (multiScope) {
-              const state = await loadDatasetState();
-              const agentDsName = datasetNameForScope("agent", cfg);
-              const agentDsId = state[agentDsName] ?? scopedIndexes.agent?.datasetId;
-              if (agentDsId) targetDatasetIds.push(agentDsId);
-            } else if (datasetId) {
-              targetDatasetIds.push(datasetId);
-            }
-
-            if (targetDatasetIds.length > 0) {
-              // Call Cognee's session persistence endpoint via the generic fetchJson
-              await client.fetchAPI("/api/v1/sessions/persist", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  session_ids: [sessionId],
-                  dataset_ids: targetDatasetIds,
-                }),
-              }).catch(() => {
-                // Session persistence endpoint may not exist on all Cognee versions.
-                // Fail silently — this is an enhancement, not critical path.
-                api.logger.debug?.("cognee-openclaw: session persistence endpoint not available");
-              });
-            }
-          } catch (error) {
-            api.logger.warn?.(`cognee-openclaw: session persistence failed: ${String(error)}`);
-          }
-        }
-
-        // Sync file changes
         try {
           if (multiScope) {
             try {
-              const freshIndexes = await loadScopedSyncIndexes();
-              scopedIndexes = freshIndexes;
-            } catch { /* fall through */ }
+              scopedIndexes = await loadScopedSyncIndexes();
+            } catch { /* keep cached scopedIndexes */ }
 
             const files = await collectMemoryFiles(workspaceDir);
 
@@ -665,7 +658,7 @@ const memoryCogneePlugin = {
             if (!hasChanges) return;
 
             api.logger.info?.("cognee-openclaw: detected changes, syncing across scopes...");
-            const result = await syncFilesScoped(client, files, files, scopedIndexes, cfg, api.logger);
+            const result = await syncFilesScoped(client, files, files, scopedIndexes, cfg, api.logger, ctx.agentId);
             api.logger.info?.(`cognee-openclaw: post-agent sync: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted`);
           } else {
             try {
@@ -673,7 +666,7 @@ const memoryCogneePlugin = {
               syncIndex.entries = freshIndex.entries;
               if (freshIndex.datasetId) syncIndex.datasetId = freshIndex.datasetId;
               if (freshIndex.datasetName) syncIndex.datasetName = freshIndex.datasetName;
-            } catch { /* fall through */ }
+            } catch { /* keep cached syncIndex */ }
 
             const files = await collectMemoryFiles(workspaceDir);
             const changedFiles = files.filter((f) => {
@@ -696,18 +689,37 @@ const memoryCogneePlugin = {
         }
       });
 
+      api.on("session_start", async (event) => {
+        if (cfg.enableSessions) sessionId = event.sessionId;
+      });
+
       // Final sweep when the openclaw session closes. Catches memory file
-      // edits that happened outside an agent_end (failed runs, manual
-      // edits between turns, tool writes outside the agent loop).
-      api.on("session_end", async () => {
+      // edits that happened outside an agent_end.
+      api.on("session_end", async (event) => {
         await Promise.all([stateReady, serviceReady]);
-        if (!resolvedWorkspaceDir) return;
+        if (!resolvedWorkspaceDir) {
+          sessionId = undefined;
+          return;
+        }
         try {
-          const result = await runSync(resolvedWorkspaceDir, api.logger);
+          const result = await runSync(resolvedWorkspaceDir, api.logger, lastAgentId);
           api.logger.info?.(`cognee-openclaw: session-end sync: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted`);
         } catch (error) {
           api.logger.warn?.(`cognee-openclaw: session-end sync failed: ${String(error)}`);
         }
+
+        // Bridge session-cache QAs (including any auto-captured feedback) into the graph.
+        if (cfg.improveOnSessionEnd && event.sessionId) {
+          const dsName = multiScope ? datasetNameForScope("agent", cfg, lastAgentId) : cfg.datasetName;
+          try {
+            const result = await client.improve({ datasetName: dsName, sessionIds: [event.sessionId] });
+            api.logger.info?.(`cognee-openclaw: session-end improve dispatched for session ${event.sessionId} (status=${result.status ?? "?"})`);
+          } catch (error) {
+            api.logger.warn?.(`cognee-openclaw: session-end improve failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        sessionId = undefined;
       });
     }
   },

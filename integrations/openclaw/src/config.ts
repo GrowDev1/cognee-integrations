@@ -16,6 +16,7 @@ export const DEFAULT_AUTO_RECALL = true;
 export const DEFAULT_AUTO_INDEX = true;
 export const DEFAULT_AUTO_COGNIFY = true;
 export const DEFAULT_AUTO_MEMIFY = false;
+export const DEFAULT_IMPROVE_ON_SESSION_END = true;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 export const DEFAULT_INGESTION_TIMEOUT_MS = 300_000;
 
@@ -71,6 +72,7 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
   const autoIndex = typeof raw.autoIndex === "boolean" ? raw.autoIndex : DEFAULT_AUTO_INDEX;
   const autoCognify = typeof raw.autoCognify === "boolean" ? raw.autoCognify : DEFAULT_AUTO_COGNIFY;
   const autoMemify = typeof raw.autoMemify === "boolean" ? raw.autoMemify : DEFAULT_AUTO_MEMIFY;
+  const improveOnSessionEnd = typeof raw.improveOnSessionEnd === "boolean" ? raw.improveOnSessionEnd : DEFAULT_IMPROVE_ON_SESSION_END;
   const requestTimeoutMs = typeof raw.requestTimeoutMs === "number" ? raw.requestTimeoutMs : DEFAULT_REQUEST_TIMEOUT_MS;
   const ingestionTimeoutMs = typeof raw.ingestionTimeoutMs === "number" ? raw.ingestionTimeoutMs : DEFAULT_INGESTION_TIMEOUT_MS;
 
@@ -85,6 +87,7 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
   const companyDataset = raw.companyDataset?.trim() || "";
   const userDatasetPrefix = raw.userDatasetPrefix?.trim() || "";
   const agentDatasetPrefix = raw.agentDatasetPrefix?.trim() || "";
+  const agentDatasetTemplate = raw.agentDatasetTemplate?.trim() || "";
   const userId = raw.userId?.trim() || process.env.OPENCLAW_USER_ID || "";
   const agentId = raw.agentId?.trim() || process.env.OPENCLAW_AGENT_ID || "default";
   const recallScopes = Array.isArray(raw.recallScopes) ? raw.recallScopes : DEFAULT_RECALL_SCOPES;
@@ -103,13 +106,13 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
 
   return {
     mode, baseUrl, apiKey, username, password, datasetName,
-    companyDataset, userDatasetPrefix, agentDatasetPrefix, userId, agentId,
+    companyDataset, userDatasetPrefix, agentDatasetPrefix, agentDatasetTemplate, userId, agentId,
     recallScopes, defaultWriteScope, scopeRouting,
     recallInjectionPosition,
     enableSessions, persistSessionsAfterEnd,
     searchType, searchPrompt, deleteMode,
     maxResults, minScore, maxTokens,
-    autoRecall, autoIndex, autoCognify, autoMemify,
+    autoRecall, autoIndex, autoCognify, autoMemify, improveOnSessionEnd,
     requestTimeoutMs, ingestionTimeoutMs,
   };
 }

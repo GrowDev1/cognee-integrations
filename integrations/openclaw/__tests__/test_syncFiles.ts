@@ -58,6 +58,7 @@ function baseCfg(overrides: Partial<CogneePluginConfig> = {}): Required<CogneePl
     companyDataset: "",
     userDatasetPrefix: "",
     agentDatasetPrefix: "",
+    agentDatasetTemplate: "",
     userId: "",
     agentId: "default",
     recallScopes: ["agent", "user", "company"] as MemoryScope[],
@@ -83,6 +84,7 @@ function baseCfg(overrides: Partial<CogneePluginConfig> = {}): Required<CogneePl
     autoIndex: true,
     autoCognify: true,
     autoMemify: false,
+    improveOnSessionEnd: true,
     requestTimeoutMs: 30000,
     ingestionTimeoutMs: 300000,
     ...overrides,
@@ -193,6 +195,42 @@ describe("datasetNameForScope", () => {
   it("uses agentDatasetPrefix with agentId", () => {
     expect(datasetNameForScope("agent", baseCfg({ agentDatasetPrefix: "proj-agent", agentId: "coder" }))).toBe("proj-agent-coder");
   });
+
+  it("prefers runtimeAgentId over cfg.agentId for the agent scope", () => {
+    const cfg = baseCfg({ agentDatasetPrefix: "proj-agent", agentId: "default" });
+    expect(datasetNameForScope("agent", cfg, "ebay")).toBe("proj-agent-ebay");
+    expect(datasetNameForScope("agent", cfg, "research")).toBe("proj-agent-research");
+  });
+
+  it("falls back to cfg.agentId when runtimeAgentId is empty or whitespace", () => {
+    const cfg = baseCfg({ agentDatasetPrefix: "proj-agent", agentId: "static" });
+    expect(datasetNameForScope("agent", cfg, "")).toBe("proj-agent-static");
+    expect(datasetNameForScope("agent", cfg, "   ")).toBe("proj-agent-static");
+    expect(datasetNameForScope("agent", cfg, undefined)).toBe("proj-agent-static");
+  });
+
+  it("ignores runtimeAgentId for non-agent scopes", () => {
+    const cfg = baseCfg({ companyDataset: "shared", userDatasetPrefix: "u", userId: "alice" });
+    expect(datasetNameForScope("company", cfg, "ebay")).toBe("shared");
+    expect(datasetNameForScope("user", cfg, "ebay")).toBe("u-alice");
+  });
+
+  it("agentDatasetTemplate substitutes {agentId} and overrides agentDatasetPrefix", () => {
+    const cfg = baseCfg({ agentDatasetTemplate: "{agentId}", agentDatasetPrefix: "ignored", agentId: "default" });
+    expect(datasetNameForScope("agent", cfg, "ebay")).toBe("ebay");
+    expect(datasetNameForScope("agent", cfg, "research")).toBe("research");
+  });
+
+  it("agentDatasetTemplate supports prefixed templates", () => {
+    const cfg = baseCfg({ agentDatasetTemplate: "memory-{agentId}-prod", agentId: "default" });
+    expect(datasetNameForScope("agent", cfg, "ebay")).toBe("memory-ebay-prod");
+  });
+
+  it("agentDatasetTemplate falls back to cfg.agentId when runtimeAgentId is absent", () => {
+    const cfg = baseCfg({ agentDatasetTemplate: "ds-{agentId}", agentId: "static" });
+    expect(datasetNameForScope("agent", cfg)).toBe("ds-static");
+    expect(datasetNameForScope("agent", cfg, "")).toBe("ds-static");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -211,6 +249,9 @@ describe("isMultiScopeEnabled", () => {
   });
   it("returns true when agentDatasetPrefix is set", () => {
     expect(isMultiScopeEnabled(baseCfg({ agentDatasetPrefix: "proj-agent" }))).toBe(true);
+  });
+  it("returns true when agentDatasetTemplate is set", () => {
+    expect(isMultiScopeEnabled(baseCfg({ agentDatasetTemplate: "{agentId}" }))).toBe(true);
   });
 });
 

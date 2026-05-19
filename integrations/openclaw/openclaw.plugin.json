@@ -46,6 +46,10 @@
         "type": "string",
         "description": "Prefix for agent-scoped datasets (becomes '{prefix}-{agentId}'). Setting this enables multi-scope mode."
       },
+      "agentDatasetTemplate": {
+        "type": "string",
+        "description": "Template for the per-agent dataset name with '{agentId}' placeholder (e.g. '{agentId}' for bare id, 'memory-{agentId}' for prefixed). Takes precedence over agentDatasetPrefix when set. Enables multi-scope mode."
+      },
       "userId": {
         "type": "string",
         "description": "User identifier for user-scoped memory (or set OPENCLAW_USER_ID env var)"
