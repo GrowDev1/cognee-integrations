@@ -106,12 +106,6 @@ tail -f ~/.cognee-plugin/codex/recall-audit.log
 tail -f ~/.cognee-plugin/codex/exit-watcher.log
 ```
 
-Cognee's own logs are under:
-
-```bash
-~/.cognee/logs/
-```
-
 ## What The Hooks Do
 
 - `SessionStart`: resolves session, dataset, user, starts idle and exit watchers.
@@ -120,7 +114,3 @@ Cognee's own logs are under:
 - `Stop`: stores the assistant response paired with the pending user prompt.
 - `PreCompact`: emits a compact session/trace memory anchor and starts graph sync.
 - `SessionEnd`: starts graph sync when the Codex client dispatches this hook.
-
-Codex CLI may not dispatch `SessionEnd` on normal shutdown. The plugin therefore
-starts an exit watcher at `SessionStart`; it waits for the owning Codex process
-to exit and then starts the detached graph sync worker.
