@@ -58,13 +58,13 @@ def _as_dict(entry):
     if hasattr(entry, "model_dump"):
         try:
             return entry.model_dump()
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("precompact_model_dump_failed", {"error": str(exc)[:200]})
     if hasattr(entry, "dict"):
         try:
             return entry.dict()
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("precompact_dict_dump_failed", {"error": str(exc)[:200]})
     if hasattr(entry, "__dict__"):
         return dict(entry.__dict__)
     return entry

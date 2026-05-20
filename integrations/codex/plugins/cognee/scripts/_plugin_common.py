@@ -46,8 +46,8 @@ def load_resolved() -> dict:
     if _RESOLVED_CACHE.exists():
         try:
             return json.loads(_RESOLVED_CACHE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("resolved_load_failed", {"path": str(_RESOLVED_CACHE), "error": str(exc)[:200]})
     return {}
 
 
@@ -55,8 +55,8 @@ def _load_json_file(path: Path) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("json_load_failed", {"path": str(path), "error": str(exc)[:200]})
     return {}
 
 
@@ -64,8 +64,8 @@ def _write_json_file(path: Path, data: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("json_write_failed", {"path": str(path), "error": str(exc)[:200]})
 
 
 def _bridge_cache_key(dataset: str, session_id: str) -> str:
@@ -113,8 +113,8 @@ async def resolve_user(user_id: str):
             user = await get_user(UUID(user_id))
             if user:
                 return user
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("resolve_user_failed", {"user_id": user_id, "error": str(exc)[:200]})
     from cognee.modules.users.methods import get_default_user
 
     return await get_default_user()
@@ -163,8 +163,8 @@ def notify(msg: str) -> None:
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             with _ACTIVITY_LOG.open("a", encoding="utf-8") as fh:
                 fh.write(f"{ts} {line}\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("activity_log_write_failed", {"error": str(exc)[:200]})
 
 
 @contextmanager
@@ -210,7 +210,8 @@ def bump_save_counter(session_id: str, kind: str) -> None:
         data = (
             json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
         )
-    except Exception:
+    except Exception as exc:
+        hook_log("save_counter_read_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
         data = {}
     sess = data.get(session_id) or {k: 0 for k in SAVE_KINDS}
     sess[kind] = int(sess.get(kind, 0)) + 1
@@ -218,8 +219,8 @@ def bump_save_counter(session_id: str, kind: str) -> None:
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _SAVE_COUNTER.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("save_counter_write_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
 
 
 def read_and_reset_save_counter(session_id: str) -> dict:
@@ -231,15 +232,16 @@ def read_and_reset_save_counter(session_id: str) -> dict:
         data = (
             json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
         )
-    except Exception:
+    except Exception as exc:
+        hook_log("save_counter_reset_read_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
         return zero
     sess = data.get(session_id) or zero
     data[session_id] = dict(zero)
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _SAVE_COUNTER.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("save_counter_reset_write_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
     return {k: int(sess.get(k, 0)) for k in SAVE_KINDS}
 
 
@@ -318,8 +320,8 @@ def bump_turn_counter(session_id: str) -> tuple[int, bool]:
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _COUNTER_FILE.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("turn_counter_write_failed", {"path": str(_COUNTER_FILE), "error": str(exc)[:200]})
 
     should_improve = threshold > 0 and count % threshold == 0
     return count, should_improve
@@ -330,8 +332,8 @@ def touch_activity() -> None:
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _ACTIVITY_FILE.write_text(str(datetime.now(timezone.utc).timestamp()), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("activity_touch_failed", {"path": str(_ACTIVITY_FILE), "error": str(exc)[:200]})
 
 
 @contextmanager
@@ -346,7 +348,8 @@ def sync_lock(owner: str):
                 current = json.loads(_SYNC_LOCK.read_text(encoding="utf-8"))
                 created_at = float(current.get("created_at", 0))
                 pid = int(current.get("pid", 0))
-            except Exception:
+            except Exception as exc:
+                hook_log("sync_lock_read_failed", {"owner": owner, "error": str(exc)[:200]})
                 created_at = 0
                 pid = 0
             pid_alive = False
@@ -361,8 +364,8 @@ def sync_lock(owner: str):
             if not pid_alive or now - created_at > SYNC_LOCK_STALE_SECONDS:
                 try:
                     _SYNC_LOCK.unlink()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    hook_log("sync_lock_unlink_failed", {"owner": owner, "error": str(exc)[:200]})
         try:
             fd = os.open(str(_SYNC_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -376,8 +379,8 @@ def sync_lock(owner: str):
         if acquired:
             try:
                 _SYNC_LOCK.unlink()
-            except Exception:
-                pass
+            except Exception as exc:
+                hook_log("sync_lock_release_failed", {"owner": owner, "error": str(exc)[:200]})
 
 
 def _local_api_url() -> str:

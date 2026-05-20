@@ -56,7 +56,8 @@ def _watcher_alive() -> bool:
         pid = int(_WATCHER_PID.read_text(encoding="utf-8").strip())
         os.kill(pid, 0)
         return True
-    except Exception:
+    except Exception as exc:
+        hook_log("prompt_watcher_alive_check_failed", {"error": str(exc)[:200]})
         return False
 
 
@@ -70,8 +71,8 @@ def _ensure_idle_watcher(session_id: str, dataset: str, user_id: str, config: di
     try:
         if _WATCHER_STOP.exists():
             _WATCHER_STOP.unlink()
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("prompt_watcher_stop_unlink_failed", {"error": str(exc)[:200]})
 
     bootstrap = {
         "session_id": session_id,
@@ -88,7 +89,8 @@ def _ensure_idle_watcher(session_id: str, dataset: str, user_id: str, config: di
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = log_path.open("a", encoding="utf-8")
-    except Exception:
+    except Exception as exc:
+        hook_log("prompt_watcher_log_open_failed", {"error": str(exc)[:200]})
         log_fh = subprocess.DEVNULL
 
     try:

@@ -68,15 +68,15 @@ def _spawn_idle_watcher(session_id: str, dataset: str, user_id: str, config: dic
         try:
             pid = int(_WATCHER_PID.read_text(encoding="utf-8").strip())
             os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("idle_watcher_kill_failed", {"error": str(exc)[:200]})
 
     # Clear any stale stop sentinel from a previous run.
     try:
         if _WATCHER_STOP.exists():
             _WATCHER_STOP.unlink()
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("watcher_stop_unlink_failed", {"error": str(exc)[:200]})
 
     # Only the non-secret surface of config needs to travel — the
     # watcher re-runs ``ensure_cognee_ready`` on its own.
@@ -95,7 +95,8 @@ def _spawn_idle_watcher(session_id: str, dataset: str, user_id: str, config: dic
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = log_path.open("a", encoding="utf-8")
-    except Exception:
+    except Exception as exc:
+        hook_log("watcher_log_open_failed", {"error": str(exc)[:200]})
         log_fh = subprocess.DEVNULL
 
     try:
@@ -121,7 +122,8 @@ def _find_codex_parent_pid() -> int:
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except Exception as exc:
+        hook_log("find_codex_parent_failed", {"error": str(exc)[:200]})
         return fallback
 
     table: dict[int, tuple[int, str]] = {}
@@ -154,8 +156,8 @@ def _spawn_exit_watcher(session_id: str, dataset: str) -> None:
         if _EXIT_WATCHER_PID.exists():
             pid = int(_EXIT_WATCHER_PID.read_text(encoding="utf-8").strip())
             os.kill(pid, signal.SIGTERM)
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("exit_watcher_kill_failed", {"error": str(exc)[:200]})
 
     bootstrap = {
         "parent_pid": _find_codex_parent_pid(),
@@ -166,7 +168,8 @@ def _spawn_exit_watcher(session_id: str, dataset: str) -> None:
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = log_path.open("a", encoding="utf-8")
-    except Exception:
+    except Exception as exc:
+        hook_log("exit_watcher_log_open_failed", {"error": str(exc)[:200]})
         log_fh = subprocess.DEVNULL
 
     try:

@@ -242,8 +242,8 @@ async def _run(prompt: str) -> dict | None:
             ),
             encoding="utf-8",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("last_recall_write_failed", {"error": str(exc)[:200]})
 
     # Build a one-line visibility header so the user (via the assistant's
     # context) can tell that memory fired on this turn — both what it
@@ -307,8 +307,8 @@ async def _run(prompt: str) -> dict | None:
                 )
                 + "\n"
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("recall_audit_write_failed", {"error": str(exc)[:200]})
 
     output = {
         "hookSpecificOutput": {

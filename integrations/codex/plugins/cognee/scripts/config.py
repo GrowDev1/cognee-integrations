@@ -25,6 +25,7 @@ _CONFIG_DIR = Path.home() / ".cognee-plugin"
 _STATE_DIR = _CONFIG_DIR / "codex"
 _CONFIG_FILE = _CONFIG_DIR / "config.json"
 _BRIDGE_STATE_FILE = _STATE_DIR / "bridge_state.json"
+_HOOK_LOG = _STATE_DIR / "hook.log"
 
 _DEFAULTS = {
     "dataset": "codex_sessions",
@@ -40,6 +41,24 @@ _DEFAULTS = {
     # Legacy server mode
     "base_url": "",
 }
+
+
+def _config_log(event: str, detail: dict | None = None) -> None:
+    try:
+        from datetime import datetime, timezone
+
+        _HOOK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        line = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "event": event,
+        }
+        if detail:
+            line["detail"] = detail
+        with _HOOK_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, default=str) + "\n")
+    except Exception:
+        pass
 
 # Env var overrides (env var name → config key)
 _ENV_MAP = {
@@ -66,8 +85,8 @@ def load_config() -> dict:
         try:
             file_cfg = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
             config.update({k: v for k, v in file_cfg.items() if v is not None and v != ""})
-        except Exception:
-            pass
+        except Exception as exc:
+            _config_log("config_file_load_failed", {"path": str(_CONFIG_FILE), "error": str(exc)[:200]})
 
     # Layer 3: env vars (highest priority)
     for env_key, config_key in _ENV_MAP.items():
@@ -230,8 +249,8 @@ async def _ensure_identity_via_api(service_url: str, config: dict) -> tuple:
                                 file=sys.stderr,
                             )
                             return _get_user_id_from_jwt(jwt), agent_key
-        except Exception:
-            pass
+        except Exception as exc:
+            _config_log("agent_api_key_lookup_failed", {"error": str(exc)[:200]})
 
         # 4. Create API key for agent
         try:
@@ -432,7 +451,8 @@ def _read_field(entry, field: str) -> str:
 def _load_bridge_state() -> dict:
     try:
         return json.loads(_BRIDGE_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        _config_log("bridge_state_load_failed", {"path": str(_BRIDGE_STATE_FILE), "error": str(exc)[:200]})
         return {}
 
 
@@ -440,8 +460,8 @@ def _save_bridge_state(state: dict) -> None:
     try:
         _BRIDGE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _BRIDGE_STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        _config_log("bridge_state_save_failed", {"path": str(_BRIDGE_STATE_FILE), "error": str(exc)[:200]})
 
 
 def _bridge_state_key(dataset: str, session_id: str, user_id: str, kind: str) -> str:
@@ -561,6 +581,6 @@ def _get_git_branch(cwd: str) -> str:
             branch = result.stdout.strip()
             # Sanitize for use in session IDs
             return branch.replace("/", "-").replace(" ", "-")[:40]
-    except Exception:
-        pass
+    except Exception as exc:
+        _config_log("git_branch_lookup_failed", {"cwd": cwd, "error": str(exc)[:200]})
     return ""

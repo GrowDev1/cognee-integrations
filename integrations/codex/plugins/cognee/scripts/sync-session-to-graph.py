@@ -59,14 +59,14 @@ def _stop_idle_watcher() -> None:
     try:
         _WATCHER_STOP.parent.mkdir(parents=True, exist_ok=True)
         _WATCHER_STOP.write_text("stop", encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("watcher_stop_write_failed", {"error": str(exc)[:200]})
     if _WATCHER_PID.exists():
         try:
             pid = int(_WATCHER_PID.read_text(encoding="utf-8").strip())
             os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("watcher_sigterm_failed", {"error": str(exc)[:200]})
 
 
 def _spawn_detached_sync() -> bool:
@@ -122,8 +122,8 @@ def _load_resolved() -> tuple:
         try:
             data = json.loads(_RESOLVED_CACHE.read_text(encoding="utf-8"))
             return data.get("session_id", ""), data.get("dataset", ""), data.get("user_id", "")
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("sync_resolved_load_failed", {"error": str(exc)[:200]})
     config = load_config()
     return get_session_id(config), get_dataset(config), ""
 
