@@ -85,6 +85,9 @@ export type CogneePluginConfig = {
   autoIndex?: boolean;
   autoCognify?: boolean;
   autoMemify?: boolean;
+  /** On session_end, call /improve with the session_id to bridge any
+   *  feedback-bearing QAs into the permanent graph. */
+  improveOnSessionEnd?: boolean;
 
   // --- Timeouts ---
   requestTimeoutMs?: number;

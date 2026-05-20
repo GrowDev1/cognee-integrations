@@ -125,8 +125,12 @@ export async function syncFiles(
         delete syncIndex.entries[path];
         logger.info?.(`cognee-openclaw: forgot ${path}`);
       } else {
+        // Cognee 1.0.x wraps 404s as 500 with "An error occurred during deletion".
         const isNotFound = forgetResult.error && (
-          forgetResult.error.includes("404") || forgetResult.error.includes("409") || forgetResult.error.includes("not found")
+          forgetResult.error.includes("404") ||
+          forgetResult.error.includes("409") ||
+          forgetResult.error.includes("not found") ||
+          forgetResult.error.includes("An error occurred during deletion")
         );
         if (isNotFound) {
           result.deleted++;
@@ -155,6 +159,7 @@ export async function syncFilesScoped(
   scopedIndexes: ScopedSyncIndexes,
   cfg: Required<CogneePluginConfig>,
   logger: { info?: (msg: string) => void; warn?: (msg: string) => void },
+  runtimeAgentId?: string,
 ): Promise<SyncResult & { datasetIds: Record<MemoryScope, string | undefined> }> {
   const totalResult: SyncResult = { added: 0, updated: 0, skipped: 0, errors: 0, deleted: 0 };
   const datasetIds: Record<MemoryScope, string | undefined> = { company: undefined, user: undefined, agent: undefined };
@@ -184,7 +189,7 @@ export async function syncFilesScoped(
   ]);
 
   for (const scope of allScopes) {
-    const dsName = datasetNameForScope(scope, cfg);
+    const dsName = datasetNameForScope(scope, cfg, runtimeAgentId);
     const scopeChanged = changedByScope.get(scope) ?? [];
     const scopeFull = fullByScope.get(scope) ?? [];
 

@@ -4,6 +4,11 @@ import { join, relative, resolve } from "node:path";
 import type { MemoryFile } from "./types.js";
 import { MEMORY_FILE_PATTERNS } from "./config.js";
 
+// Openclaw's session-memory hook writes `memory/YYYY-MM-DD-HHMM.md` transcripts;
+// skip those — cognee's session cache already holds the same turns and we'd
+// double-ingest on /improve.
+const SESSION_MEMORY_FILE_RE = /^\d{4}-\d{2}-\d{2}-\d{4}\.md$/;
+
 export function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -53,6 +58,7 @@ async function scanDir(dir: string, workspaceDir: string): Promise<MemoryFile[]>
       const nested = await scanDir(absPath, workspaceDir);
       files.push(...nested);
     } else if (entry.isFile() && entry.name.endsWith(".md")) {
+      if (SESSION_MEMORY_FILE_RE.test(entry.name)) continue;
       const content = await fs.readFile(absPath, "utf-8");
       files.push({
         path: relative(workspaceDir, absPath),

@@ -11,8 +11,9 @@ OpenClaw plugin that adds Cognee-backed memory with **multi-scope support** (com
 - **14 search types**: From simple semantic search (CHUNKS) to chain-of-thought graph reasoning (GRAPH_COMPLETION_COT) to auto-selection (FEELING_LUCKY)
 - **Health check**: Verifies Cognee API connectivity before operations
 - **Auto-index**: Syncs memory markdown files to Cognee via `/remember` (add new, update changed, forget removed, skip unchanged). The `/remember` endpoint runs ingest, graph build, and graph enrichment in one server-side call.
+- **In-session memory**: each recall call auto-captures the turn as a `QAEntry` in Cognee's session cache; with `AUTO_FEEDBACK=true` set on the Cognee container, follow-up messages are auto-classified as feedback and attached to the previous QA; `session_end` triggers `/improve` to bridge the session cache into the graph
 - **One-command setup**: `openclaw cognee setup` configures Cognee as the sole memory provider
-- **CLI commands**: `openclaw cognee setup`, `openclaw cognee index`, `openclaw cognee status`, `openclaw cognee health`, `openclaw cognee scopes`, `openclaw cognee forget`
+- **CLI commands**: `openclaw cognee setup`, `openclaw cognee index`, `openclaw cognee status`, `openclaw cognee health`, `openclaw cognee scopes`, `openclaw cognee forget`, `openclaw cognee improve`
 
 ## Security: Recommended Plugin Allowlist
 
@@ -246,6 +247,7 @@ This lets the agent distinguish between personal context, shared knowledge, and 
 |--------|------|---------|-------------|
 | `autoRecall` | boolean | `true` | Inject memories before agent runs |
 | `autoIndex` | boolean | `true` | Sync memory files on startup, after agent runs, and on session end |
+| `improveOnSessionEnd` | boolean | `true` | On `session_end`, call `/improve` with the session id to bridge session-cache QAs into the graph |
 | ~~`autoCognify`~~ | boolean | `true` | **Deprecated** — `/remember` runs the cognify step server-side. Setting this is silently ignored. |
 | ~~`autoMemify`~~ | boolean | `false` | **Deprecated** — graph enrichment now runs server-side via `/remember`'s `self_improvement` default. Setting this is silently ignored. |
 | ~~`deleteMode`~~ | string | `soft` | **Deprecated** — `/forget` always runs the equivalent of `soft`; the legacy `hard` mode is gone (cognee's source explicitly warns against it). Setting this is silently ignored. |
@@ -281,14 +283,18 @@ openclaw cognee scopes
 # Wipe a dataset, or all of this user's data, from Cognee
 openclaw cognee forget --dataset <name>
 openclaw cognee forget --everything --confirm
+
+# Bridge captured QAs (and any feedback) into the permanent graph
+openclaw cognee improve                       # current dataset, all sessions
+openclaw cognee improve --session-id <id>     # scope to one session
 ```
 
 ## How It Works
 
 1. **On startup**: Health check, then scan `memory/` directory and call `/api/v1/remember` (one batched multipart upload per scope). Cognee runs add + cognify + improve server-side.
-2. **Before each prompt**: Call `/api/v1/recall` for each configured scope in parallel, merge results with scope labels, inject as `<cognee_memories>` context.
-3. **After each agent run**: Re-scan memory files; new files batch into a `/remember` call, changed files go through `PATCH /api/v1/update` (self-hosted) or fall through to `/remember` if update returns "not found", removed files are dropped via `POST /api/v1/forget`.
-4. **On session end**: One final sync pass to catch any edits that didn't fire `agent_end` (failed runs, manual edits between turns).
+2. **Before each prompt**: Call `/api/v1/recall` for each configured scope in parallel, merge results with scope labels, inject as `<cognee_memories>` context. The openclaw session id is passed through; Cognee uses it to auto-capture the turn as a session QA and (with `AUTO_FEEDBACK=true`) auto-attach feedback to the prior QA when one is detected.
+3. **After each agent run**: Re-scan memory files; new files batch into `/remember`, changed files go through `PATCH /update` (self-hosted) with fallback to `/remember`, removed files are dropped via `/forget`.
+4. **On session end**: Final sync sweep. With `improveOnSessionEnd` on, also dispatches `/improve` for the just-ended session id to bridge session QAs into the permanent graph.
 5. **State tracking**:
    - `~/.openclaw/memory/cognee/datasets.json` — dataset ID mapping
    - `~/.openclaw/memory/cognee/scoped-sync-indexes.json` — per-scope file hashes and data IDs
