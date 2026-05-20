@@ -145,7 +145,7 @@ export class CogneeHttpClient {
               const errorText = await retryResponse.text();
               throw new Error(`Cognee request failed (${retryResponse.status}): ${errorText}`);
             }
-            return responseParser(response);
+            return responseParser(retryResponse);
           } finally {
             clearTimeout(retryTimeout);
           }
