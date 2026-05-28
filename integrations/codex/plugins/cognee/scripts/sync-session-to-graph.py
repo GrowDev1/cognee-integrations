@@ -165,7 +165,12 @@ async def _sync(stop_watcher: bool, unregister_on_finish: bool = False):
                 wrote = persist_session_cache_to_graph_via_http(dataset, session_id)
                 hook_log(
                     "sync_bridge_done",
-                    {"session": session_id, "dataset": dataset, "via": "http_remember", "wrote": wrote},
+                    {
+                        "session": session_id,
+                        "dataset": dataset,
+                        "via": "http_remember",
+                        "wrote": wrote,
+                    },
                 )
                 print(
                     "cognee-sync: "
