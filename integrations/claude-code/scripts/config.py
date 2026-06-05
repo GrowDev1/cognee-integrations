@@ -22,14 +22,20 @@ from pathlib import Path
 from typing import Optional
 
 _CONFIG_DIR = Path.home() / ".cognee-plugin"
+_STATE_DIR = _CONFIG_DIR
 _CONFIG_FILE = _CONFIG_DIR / "config.json"
-_BRIDGE_STATE_FILE = _CONFIG_DIR / "bridge_state.json"
+_BRIDGE_STATE_FILE = _STATE_DIR / "bridge_state.json"
+_HOOK_LOG = _STATE_DIR / "hook.log"
 
 _DEFAULTS = {
     "dataset": "claude_sessions",
+    "agent_name": "claude-code-agent",
     "session_strategy": "per-directory",  # per-directory | git-branch | static
     "session_prefix": "cc",
     "top_k": 3,
+    "backend": "auto",
+    "user_email": "default_user@example.com",
+    "user_password": "default_password",
     # Cloud / remote
     "service_url": "",
     "api_key": "",
@@ -40,14 +46,40 @@ _DEFAULTS = {
     "base_url": "",
 }
 
+
+def _config_log(event: str, detail: dict | None = None) -> None:
+    try:
+        from datetime import datetime, timezone
+
+        _HOOK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        line = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "event": event,
+        }
+        if detail:
+            line["detail"] = detail
+        with _HOOK_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, default=str) + "\n")
+    except Exception:
+        pass
+
+
 # Env var overrides (env var name → config key)
 _ENV_MAP = {
+    "COGNEE_CLAUDE_BACKEND": "backend",
+    "COGNEE_CODEX_BACKEND": "backend",
+    "COGNEE_CLAUDE_DATASET": "dataset",
+    "COGNEE_CODEX_DATASET": "dataset",
+    "COGNEE_AGENT_NAME": "agent_name",
     "COGNEE_PLUGIN_DATASET": "dataset",
     "COGNEE_SESSION_STRATEGY": "session_strategy",
     "COGNEE_SESSION_PREFIX": "session_prefix",
     "COGNEE_SERVICE_URL": "service_url",
     "COGNEE_API_KEY": "api_key",
     "COGNEE_BASE_URL": "base_url",
+    "COGNEE_USER_EMAIL": "user_email",
+    "COGNEE_USER_PASSWORD": "user_password",
     "LLM_API_KEY": "llm_api_key",
     "LLM_MODEL": "llm_model",
     # Legacy compat
@@ -64,14 +96,31 @@ def load_config() -> dict:
         try:
             file_cfg = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
             config.update({k: v for k, v in file_cfg.items() if v is not None and v != ""})
-        except Exception:
-            pass
+        except Exception as exc:
+            _config_log(
+                "config_file_load_failed", {"path": str(_CONFIG_FILE), "error": str(exc)[:200]}
+            )
 
     # Layer 3: env vars (highest priority)
     for env_key, config_key in _ENV_MAP.items():
         val = os.environ.get(env_key, "")
         if val:
             config[config_key] = val
+
+    backend = str(config.get("backend") or "auto").lower()
+    if backend in ("native", "local", "sdk"):
+        config["service_url"] = ""
+        config["api_key"] = ""
+        config["base_url"] = ""
+    elif backend not in ("http", "api", "cloud", "server"):
+        # Auto mode enters managed-endpoint mode only when both values are present.
+        # Partial endpoint config is ignored to avoid ambiguous routing.
+        has_service_url = bool(str(config.get("service_url") or "").strip())
+        has_api_key = bool(str(config.get("api_key") or "").strip())
+        if has_service_url != has_api_key:
+            config["service_url"] = ""
+            config["api_key"] = ""
+            config["base_url"] = ""
 
     return config
 
@@ -80,8 +129,11 @@ def save_config(config: dict) -> None:
     """Write config to disk. Creates directory if needed."""
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     # Only save non-secret, non-default values
+    transient_keys = {"api_key", "llm_api_key", "service_url", "base_url", "backend"}
     to_save = {
-        k: v for k, v in config.items() if not k.startswith("_") and v and v != _DEFAULTS.get(k)
+        k: v
+        for k, v in config.items()
+        if k not in transient_keys and not k.startswith("_") and v and v != _DEFAULTS.get(k)
     }
     _CONFIG_FILE.write_text(json.dumps(to_save, indent=2), encoding="utf-8")
 
@@ -228,14 +280,14 @@ async def _ensure_identity_via_api(service_url: str, config: dict) -> tuple:
                                 file=sys.stderr,
                             )
                             return _get_user_id_from_jwt(jwt), agent_key
-        except Exception:
-            pass
+        except Exception as exc:
+            _config_log("agent_api_key_lookup_failed", {"error": str(exc)[:200]})
 
         # 4. Create API key for agent
         try:
             async with session.post(
                 f"{base}/api/v1/auth/api-keys",
-                json={"name": "claude-code-plugin"},
+                json={"name": "claude-plugin"},
                 cookies={"auth_token": jwt},
             ) as resp:
                 if resp.status == 200:
@@ -317,7 +369,6 @@ async def _ensure_identity_via_sdk() -> str:
         return ""
 
 
-_RESOLVED_CACHE_PATH = Path.home() / ".cognee-plugin" / "resolved.json"
 _LOCAL_SETUP_DONE = False
 
 
@@ -335,10 +386,6 @@ async def _ensure_local_databases() -> None:
 
 async def ensure_cognee_ready(config: dict) -> None:
     """Configure cognee for the active mode (cloud or local).
-
-    In cloud mode, loads the cached API key from resolved.json (written
-    by SessionStart) so that hooks running in separate processes can
-    authenticate against the server.
 
     In local SDK mode, also runs Cognee's setup() so a fresh machine or
     fresh virtualenv has its databases/tables before identity, recall, or
@@ -430,7 +477,10 @@ def _read_field(entry, field: str) -> str:
 def _load_bridge_state() -> dict:
     try:
         return json.loads(_BRIDGE_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        _config_log(
+            "bridge_state_load_failed", {"path": str(_BRIDGE_STATE_FILE), "error": str(exc)[:200]}
+        )
         return {}
 
 
@@ -438,8 +488,10 @@ def _save_bridge_state(state: dict) -> None:
     try:
         _BRIDGE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _BRIDGE_STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        _config_log(
+            "bridge_state_save_failed", {"path": str(_BRIDGE_STATE_FILE), "error": str(exc)[:200]}
+        )
 
 
 def _bridge_state_key(dataset: str, session_id: str, user_id: str, kind: str) -> str:
@@ -455,7 +507,7 @@ async def persist_session_cache_to_graph(dataset: str, session_id: str, user) ->
 
     This is a local-mode compatibility bridge for Cognee 1.0.8. The SDK's
     built-in session persistence can complete without extracting entries
-    from the file-system cache in the Claude plugin setup. Reading the same
+    from the file-system cache in the plugin setup. Reading the same
     cache directly here keeps the integration useful while still using
     cognee.remember() for the actual add+cognify pipeline.
     """
@@ -559,6 +611,6 @@ def _get_git_branch(cwd: str) -> str:
             branch = result.stdout.strip()
             # Sanitize for use in session IDs
             return branch.replace("/", "-").replace(" ", "-")[:40]
-    except Exception:
-        pass
+    except Exception as exc:
+        _config_log("git_branch_lookup_failed", {"cwd": cwd, "error": str(exc)[:200]})
     return ""

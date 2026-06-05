@@ -1,6 +1,6 @@
 """Shared helpers across plugin hook scripts.
 
-Kept deliberately small: user resolution, resolved-cache read, a
+Kept deliberately small: user resolution, runtime-state read, a
 single log-to-disk helper. Hook scripts shouldn't grow heavy because
 they run on every user prompt / tool call.
 """
@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -18,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 _PLUGIN_DIR = Path.home() / ".cognee-plugin"
-_RESOLVED_CACHE = _PLUGIN_DIR / "resolved.json"
 _HOOK_LOG = _PLUGIN_DIR / "hook.log"
 _COUNTER_FILE = _PLUGIN_DIR / "counter.json"
 _ACTIVITY_FILE = _PLUGIN_DIR / "activity.ts"
@@ -27,6 +27,9 @@ _SAVE_COUNTER = _PLUGIN_DIR / "save_counter.json"
 _SYNC_LOCK = _PLUGIN_DIR / "sync.lock"
 _HTTP_BRIDGE_CACHE = _PLUGIN_DIR / "http_bridge_cache.json"
 _HTTP_BRIDGE_STATE = _PLUGIN_DIR / "http_bridge_state.json"
+_PENDING_PROMPTS = _PLUGIN_DIR / "pending_prompts.json"
+_SUBPROCESS_LOG = _PLUGIN_DIR / "subprocess.log"
+_AGENT_KEYS_CACHE = _PLUGIN_DIR / "agent_keys.json"
 
 # Save-kinds tracked per turn. Keep this tuple in sync with bump_save_counter callers.
 SAVE_KINDS = ("prompt", "trace", "answer")
@@ -37,24 +40,173 @@ _LOG_LINE_CAP = 600
 # Default auto-improve threshold (tool calls + stops). Env override.
 AUTO_IMPROVE_EVERY_DEFAULT = 30
 SYNC_LOCK_STALE_SECONDS = 15 * 60
+_DEFAULT_LOCAL_SERVICE_URL = "http://localhost:8011"
 
 
-def load_resolved() -> dict:
-    """Load the SessionStart-cached session state."""
-    if _RESOLVED_CACHE.exists():
-        try:
-            return json.loads(_RESOLVED_CACHE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+def _sanitize_session_key(value: str) -> str:
+    safe = []
+    for ch in str(value or ""):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("._")[:120]
+
+
+def get_session_key() -> str:
+    candidates = [
+        os.environ.get("COGNEE_SESSION_KEY"),
+    ]
+    for value in candidates:
+        text = _sanitize_session_key(str(value or "").strip())
+        if text:
+            return text
+    return ""
+
+
+def set_session_key(session_key: str) -> str:
+    normalized = _sanitize_session_key(session_key)
+    if normalized:
+        os.environ["COGNEE_SESSION_KEY"] = normalized
+    return normalized
+
+
+def resolve_session_key_from_payload(payload: dict) -> tuple[str, str]:
+    """Resolve session key from a hook payload using known Claude variants."""
+    if not isinstance(payload, dict):
+        return "", "missing_payload"
+
+    def _read_path(obj: dict, path: list[str]) -> str:
+        cur = obj
+        for key in path[:-1]:
+            nxt = cur.get(key)
+            if not isinstance(nxt, dict):
+                return ""
+            cur = nxt
+        value = cur.get(path[-1])
+        return str(value or "").strip() if value is not None else ""
+
+    candidates: list[tuple[str, list[str]]] = [
+        ("payload.session_id", ["session_id"]),
+        ("payload.sessionId", ["sessionId"]),
+        ("payload.session.id", ["session", "id"]),
+        ("payload.conversation_id", ["conversation_id"]),
+        ("payload.conversationId", ["conversationId"]),
+        ("payload.conversation.id", ["conversation", "id"]),
+        ("payload.chat_id", ["chat_id"]),
+        ("payload.chatId", ["chatId"]),
+        ("payload.thread_id", ["thread_id"]),
+        ("payload.threadId", ["threadId"]),
+        ("payload.transcript.session_id", ["transcript", "session_id"]),
+        ("payload.transcript.sessionId", ["transcript", "sessionId"]),
+    ]
+    for source, path in candidates:
+        value = _read_path(payload, path)
+        if value:
+            return value, source
+    return "", "not_found"
+
+
+def _resolve_agent_name() -> str:
+    def _normalize(name: str) -> str:
+        raw = str(name or "").strip()
+        if raw.endswith("@cognee.agent"):
+            raw = raw[: -len("@cognee.agent")]
+        suffix = "_claude"
+        if raw.endswith(suffix):
+            return raw
+        return f"{raw}{suffix}"
+
+    env_name = str(os.environ.get("COGNEE_AGENT_NAME") or "").strip()
+    if env_name:
+        return _normalize(env_name)
+    try:
+        from config import load_config  # type: ignore
+
+        configured = str(load_config().get("agent_name") or "").strip()
+        if configured:
+            normalized = _normalize(configured)
+            os.environ["COGNEE_AGENT_NAME"] = normalized
+            return normalized
+    except Exception:
+        pass
+    return _normalize("claude-code-agent")
+
+
+def load_resolved(session_key: str = "") -> dict:
+    """Load runtime state from Cognee HTTP endpoints (no file cache)."""
+    resolved: dict = {}
+
+    active_session_key = _sanitize_session_key(session_key) or get_session_key()
+    if active_session_key:
+        resolved["session_key"] = active_session_key
+
+    service_url = _local_api_url().strip()
+    if service_url:
+        resolved["service_url"] = service_url
+
+    api_key = _api_key().strip()
+    if api_key:
+        resolved["api_key"] = api_key
+
+    # Resolve caller identity.
+    try:
+        me = _json_http_request("/api/v1/users/me", method="GET", timeout=10.0)
+        if isinstance(me, dict):
+            user_id = str(me.get("id") or "").strip()
+            if user_id:
+                resolved["user_id"] = user_id
+    except Exception as exc:
+        hook_log("runtime_state_users_me_failed", {"error": str(exc)[:200]})
+
+    # Resolve active connection details for this session when possible.
+    try:
+        query = ""
+        if active_session_key:
+            query = f"?agent_session_name={urllib.parse.quote(active_session_key, safe='')}"
+        conn = _json_http_request(
+            f"/api/v1/agents/connections/me{query}",
+            method="GET",
+            timeout=10.0,
+        )
+        if isinstance(conn, dict):
+            agent = conn.get("agent") if isinstance(conn.get("agent"), dict) else {}
+            if isinstance(agent, dict):
+                session_id = str(agent.get("session_id") or "").strip()
+                if session_id:
+                    resolved["session_id"] = session_id
+                agent_session_name = str(agent.get("agent_session_name") or "").strip()
+                if agent_session_name:
+                    resolved["agent_session_name"] = agent_session_name
+                agent_user_id = str(agent.get("user_id") or "").strip()
+                if agent_user_id and not resolved.get("user_id"):
+                    resolved["user_id"] = agent_user_id
+                status = str(agent.get("status") or "").strip().lower()
+                resolved["registered"] = status == "active"
+                datasets = agent.get("datasets") if isinstance(agent.get("datasets"), list) else []
+                for item in datasets:
+                    if isinstance(item, dict):
+                        name = str(item.get("name") or "").strip()
+                        if name:
+                            resolved["dataset"] = name
+                            break
+    except Exception as exc:
+        hook_log("runtime_state_connection_lookup_failed", {"error": str(exc)[:200]})
+
+    return resolved
+
+
+def write_resolved(data: dict, session_key: str = "", *, mirror_global: bool = True) -> None:
+    # Runtime state now comes from API endpoints, not local resolved files.
+    _ = (data, session_key, mirror_global)
 
 
 def _load_json_file(path: Path) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("json_load_failed", {"path": str(path), "error": str(exc)[:200]})
     return {}
 
 
@@ -62,12 +214,12 @@ def _write_json_file(path: Path, data: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("json_write_failed", {"path": str(path), "error": str(exc)[:200]})
 
 
 def _bridge_cache_key(dataset: str, session_id: str) -> str:
-    user_id = load_resolved().get("user_id", "")
+    user_id = os.environ.get("COGNEE_USER_ID", "") or load_resolved().get("user_id", "")
     return f"{user_id}:{dataset}:{session_id}"
 
 
@@ -111,8 +263,8 @@ async def resolve_user(user_id: str):
             user = await get_user(UUID(user_id))
             if user:
                 return user
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("resolve_user_failed", {"user_id": user_id, "error": str(exc)[:200]})
     from cognee.modules.users.methods import get_default_user
 
     return await get_default_user()
@@ -150,9 +302,8 @@ def notify(msg: str) -> None:
     """Print a status line to stderr (shown under the hook's status indicator).
 
     When ``COGNEE_PLUGIN_VERBOSE=1`` is set, also append a timestamped
-    line to ``~/.cognee-plugin/activity.log`` so saves that happen in
-    async hooks are ``tail -f``-visible (they never surface in the
-    Claude transcript on their own).
+    line to ``~/.cognee-plugin/activity.log`` so saves that happen
+    in async hooks are ``tail -f``-visible.
     """
     line = f"cognee-plugin: {msg}"
     print(line, file=sys.stderr)
@@ -162,8 +313,40 @@ def notify(msg: str) -> None:
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             with _ACTIVITY_LOG.open("a", encoding="utf-8") as fh:
                 fh.write(f"{ts} {line}\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            hook_log("activity_log_write_failed", {"error": str(exc)[:200]})
+
+
+@contextmanager
+def quiet_hook_output(label: str):
+    """Redirect stdout/stderr to a plugin log while a hook does Cognee work.
+
+    Codex parses stdout for JSON on hooks such as UserPromptSubmit. Some
+    Cognee dependencies write directly to file descriptors, so redirect at
+    the OS fd level instead of relying only on Python's redirect_stdout.
+    """
+    _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    log_fd = os.open(_SUBPROCESS_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        marker = (
+            f"\n--- {datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+            f"{label} pid={os.getpid()} ---\n"
+        )
+        os.write(
+            log_fd,
+            marker.encode("utf-8"),
+        )
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        os.close(log_fd)
 
 
 def bump_save_counter(session_id: str, kind: str) -> None:
@@ -179,7 +362,8 @@ def bump_save_counter(session_id: str, kind: str) -> None:
         data = (
             json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
         )
-    except Exception:
+    except Exception as exc:
+        hook_log("save_counter_read_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
         data = {}
     sess = data.get(session_id) or {k: 0 for k in SAVE_KINDS}
     sess[kind] = int(sess.get(kind, 0)) + 1
@@ -187,8 +371,8 @@ def bump_save_counter(session_id: str, kind: str) -> None:
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _SAVE_COUNTER.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("save_counter_write_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
 
 
 def read_and_reset_save_counter(session_id: str) -> dict:
@@ -200,16 +384,62 @@ def read_and_reset_save_counter(session_id: str) -> dict:
         data = (
             json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
         )
-    except Exception:
+    except Exception as exc:
+        hook_log(
+            "save_counter_reset_read_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]}
+        )
         return zero
     sess = data.get(session_id) or zero
     data[session_id] = dict(zero)
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _SAVE_COUNTER.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log(
+            "save_counter_reset_write_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]}
+        )
     return {k: int(sess.get(k, 0)) for k in SAVE_KINDS}
+
+
+def _pending_keys(session_id: str, turn_id: str = "") -> tuple[str, str]:
+    session_key = f"{session_id}:"
+    turn_key = f"{session_id}:{turn_id}" if turn_id else session_key
+    return turn_key, session_key
+
+
+def remember_pending_prompt(
+    session_id: str, prompt: str, *, turn_id: str = "", context: str = ""
+) -> None:
+    """Store the current prompt until Codex Stop provides the assistant answer."""
+    if not session_id or not prompt.strip():
+        return
+    data = _load_json_file(_PENDING_PROMPTS)
+    turn_key, session_key = _pending_keys(session_id, turn_id)
+    entry = {
+        "prompt": prompt[:8000],
+        "context": context[:2000],
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    data[turn_key] = entry
+    data[session_key] = entry
+    _write_json_file(_PENDING_PROMPTS, data)
+
+
+def pop_pending_prompt(session_id: str, *, turn_id: str = "") -> dict:
+    """Return and remove the prompt saved for this Codex turn."""
+    if not session_id:
+        return {"prompt": "", "context": ""}
+    data = _load_json_file(_PENDING_PROMPTS)
+    turn_key, session_key = _pending_keys(session_id, turn_id)
+    entry = data.pop(turn_key, None) or data.get(session_key) or {}
+    data.pop(session_key, None)
+    _write_json_file(_PENDING_PROMPTS, data)
+    if not isinstance(entry, dict):
+        return {"prompt": "", "context": ""}
+    return {
+        "prompt": str(entry.get("prompt") or ""),
+        "context": str(entry.get("context") or ""),
+    }
 
 
 def _auto_improve_threshold() -> int:
@@ -248,8 +478,8 @@ def bump_turn_counter(session_id: str) -> tuple[int, bool]:
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _COUNTER_FILE.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("turn_counter_write_failed", {"path": str(_COUNTER_FILE), "error": str(exc)[:200]})
 
     should_improve = threshold > 0 and count % threshold == 0
     return count, should_improve
@@ -260,8 +490,8 @@ def touch_activity() -> None:
     try:
         _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
         _ACTIVITY_FILE.write_text(str(datetime.now(timezone.utc).timestamp()), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("activity_touch_failed", {"path": str(_ACTIVITY_FILE), "error": str(exc)[:200]})
 
 
 @contextmanager
@@ -276,7 +506,8 @@ def sync_lock(owner: str):
                 current = json.loads(_SYNC_LOCK.read_text(encoding="utf-8"))
                 created_at = float(current.get("created_at", 0))
                 pid = int(current.get("pid", 0))
-            except Exception:
+            except Exception as exc:
+                hook_log("sync_lock_read_failed", {"owner": owner, "error": str(exc)[:200]})
                 created_at = 0
                 pid = 0
             pid_alive = False
@@ -291,8 +522,8 @@ def sync_lock(owner: str):
             if not pid_alive or now - created_at > SYNC_LOCK_STALE_SECONDS:
                 try:
                     _SYNC_LOCK.unlink()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    hook_log("sync_lock_unlink_failed", {"owner": owner, "error": str(exc)[:200]})
         try:
             fd = os.open(str(_SYNC_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -306,20 +537,110 @@ def sync_lock(owner: str):
         if acquired:
             try:
                 _SYNC_LOCK.unlink()
-            except Exception:
-                pass
+            except Exception as exc:
+                hook_log("sync_lock_release_failed", {"owner": owner, "error": str(exc)[:200]})
+
+
+def _local_api_url_with_source() -> tuple[str, str]:
+    local_env = str(os.environ.get("COGNEE_LOCAL_API_URL", "") or "").strip()
+    if local_env:
+        return local_env, "env_local_api_url"
+    service_env = str(os.environ.get("COGNEE_SERVICE_URL", "") or "").strip()
+    if service_env:
+        return service_env, "env_service_url"
+    return _DEFAULT_LOCAL_SERVICE_URL, "default_local"
 
 
 def _local_api_url() -> str:
-    return (
-        os.environ.get("COGNEE_LOCAL_API_URL")
-        or os.environ.get("COGNEE_SERVICE_URL")
-        or "http://localhost:8000"
-    )
+    return _local_api_url_with_source()[0]
+
+
+def _normalize_service_url(value: str) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _api_key_with_source(service_url: str = "") -> tuple[str, str]:
+    service_url = _normalize_service_url(service_url or _local_api_url())
+    agent_name = _resolve_agent_name()
+    if not service_url:
+        env_key = str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+        return env_key, ("env_api_key" if env_key else "missing")
+
+    cache = _load_json_file(_AGENT_KEYS_CACHE)
+    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+    if isinstance(entries, dict) and agent_name:
+        selected: dict | None = None
+        cache_key = f"{service_url}::{agent_name}"
+        entry = entries.get(cache_key)
+        if isinstance(entry, dict):
+            selected = entry
+        else:
+            # Backward compatibility for older cache formats where keys may differ.
+            for value in entries.values():
+                if not isinstance(value, dict):
+                    continue
+                url = _normalize_service_url(str(value.get("service_url") or ""))
+                name = str(value.get("agent_name") or "").strip()
+                if url == service_url and name == agent_name:
+                    selected = value
+                    break
+        if isinstance(selected, dict):
+            key = str(selected.get("api_key") or "").strip()
+            if key:
+                os.environ["COGNEE_API_KEY"] = key
+                return key, "cache_agent_keys"
+
+    # Fallback for bootstrap paths before an agent key is available.
+    env_key = str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+    return env_key, ("env_api_key" if env_key else "missing")
 
 
 def _api_key() -> str:
-    return load_resolved().get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")
+    return _api_key_with_source()[0]
+
+
+def resolved_http_endpoint_auth() -> tuple[str, str]:
+    """Return (service_url, api_key) for runtime HTTP calls.
+
+    Service URL always falls back to localhost. API key is resolved from env
+    first, then from agent_keys cache by (service_url, agent_name).
+    """
+    service_url = _normalize_service_url(_local_api_url())
+    api_key = _api_key().strip()
+    if service_url:
+        os.environ["COGNEE_SERVICE_URL"] = service_url
+    if api_key:
+        os.environ["COGNEE_API_KEY"] = api_key
+    return service_url, api_key
+
+
+def http_api_ready() -> bool:
+    service_url, api_key = resolved_http_endpoint_auth()
+    return bool(service_url and api_key)
+
+
+def resolve_runtime_mode() -> dict:
+    """Resolve hook runtime mode from effective endpoint auth."""
+    service_url_raw, url_source = _local_api_url_with_source()
+    service_url = _normalize_service_url(service_url_raw)
+    api_key, key_source = _api_key_with_source(service_url)
+    mode = "http" if (service_url and api_key) else "local_sdk"
+    if service_url:
+        os.environ["COGNEE_SERVICE_URL"] = service_url
+    if api_key:
+        os.environ["COGNEE_API_KEY"] = api_key
+    return {
+        "mode": mode,
+        "service_url": service_url,
+        "api_key_present": bool(api_key),
+        "url_source": url_source,
+        "key_source": key_source,
+    }
+
+
+def set_agent_registration(registered: bool, session_key: str = "") -> None:
+    # No local resolved cache to patch.
+    _ = (registered, session_key)
 
 
 def _json_http_request(
@@ -375,6 +696,55 @@ def remember_entry_via_http(
         },
         timeout=timeout,
     )
+
+
+def register_agent_via_http(
+    *,
+    agent_session_name: str,
+    session_id: str = "",
+    dataset_names: list[str] | None = None,
+    timeout: float = 15.0,
+) -> tuple[bool, dict]:
+    payload = {
+        "agent_session_name": agent_session_name,
+        "type": "api",
+        "memory_mode": "hybrid",
+        "source": "api",
+    }
+    if session_id:
+        payload["session_id"] = session_id
+    if dataset_names:
+        payload["dataset_names"] = [str(name) for name in dataset_names if str(name).strip()]
+
+    try:
+        result = _json_http_request(
+            "/api/v1/agents/register", payload, method="POST", timeout=timeout
+        )
+        if isinstance(result, dict):
+            return True, result
+        return True, {}
+    except Exception as exc:
+        hook_log("agent_register_failed", {"error": str(exc)[:200]})
+        return False, {}
+
+
+def unregister_agent_via_http(
+    *, agent_session_name: str, timeout: float = 15.0
+) -> tuple[bool, int]:
+    try:
+        result = _json_http_request(
+            "/api/v1/agents/unregister",
+            {"agent_session_name": agent_session_name},
+            method="POST",
+            timeout=timeout,
+        )
+        if isinstance(result, dict):
+            count = int(result.get("activeAgents", 0) or result.get("active_agents", 0) or 0)
+            return True, count
+        return True, 0
+    except Exception as exc:
+        hook_log("agent_unregister_failed", {"error": str(exc)[:200]})
+        return False, 0
 
 
 def recall_via_http(

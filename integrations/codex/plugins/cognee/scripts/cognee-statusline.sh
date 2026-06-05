@@ -49,6 +49,11 @@ plugin_dir = pathlib.Path(sys.argv[1])
 service_url = (os.environ.get("COGNEE_SERVICE_URL") or os.environ.get("COGNEE_LOCAL_API_URL") or "http://localhost:8011").strip()
 api_key = (os.environ.get("COGNEE_API_KEY") or "").strip()
 agent_name = (os.environ.get("COGNEE_AGENT_NAME") or "").strip()
+if agent_name:
+    if agent_name.endswith("@cognee.agent"):
+        agent_name = agent_name[: -len("@cognee.agent")]
+    if not agent_name.endswith("_codex"):
+        agent_name = f"{agent_name}_codex"
 
 if not api_key and service_url and agent_name:
     cache_path = plugin_dir / "agent_keys.json"

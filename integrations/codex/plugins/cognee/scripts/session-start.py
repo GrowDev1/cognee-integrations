@@ -242,10 +242,19 @@ async def _login_default_user_for_owner_api_key(service_url: str, config: dict) 
 
 
 def _resolve_agent_name(config: dict, cwd: str) -> str:
+    def _normalize(name: str) -> str:
+        raw = str(name or "").strip()
+        if raw.endswith("@cognee.agent"):
+            raw = raw[: -len("@cognee.agent")]
+        suffix = "_codex"
+        if raw.endswith(suffix):
+            return raw
+        return f"{raw}{suffix}"
+
     configured = str(config.get("agent_name", "") or "").strip()
     if configured:
-        return configured
-    return f"codex-{Path(cwd).name}"
+        return _normalize(configured)
+    return _normalize(f"codex-{Path(cwd).name}")
 
 
 async def _create_agent_with_bootstrap_key(

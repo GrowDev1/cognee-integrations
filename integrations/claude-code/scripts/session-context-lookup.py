@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Search session + trace + graph-context for context relevant to the user's prompt.
 
-Runs on the UserPromptSubmit hook. Calls ``cognee.recall`` with
+Runs on the Codex UserPromptSubmit hook. Calls ``cognee.recall`` with
 ``scope=["session","trace","graph_context"]`` so every layer the
 SessionManager holds (QA entries, agent trace steps, and the distilled
-graph-knowledge snapshot from ``improve()``) flows back into Claude's
+graph-knowledge snapshot from ``improve()``) flows back into Codex's
 context.
 
 Configuration:
-    Uses resolved session ID from SessionStart hook (via ~/.cognee-plugin/resolved.json).
+    Resolves session state via Cognee HTTP endpoints.
 """
 
 import asyncio
@@ -19,19 +19,25 @@ import sys
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
+    get_session_key,
     hook_log,
     load_resolved,
     notify,
+    quiet_hook_output,
     read_and_reset_save_counter,
     recall_via_http,
+    resolve_runtime_mode,
+    resolve_session_key_from_payload,
     resolve_user,
+    set_session_key,
 )
-from config import ensure_cognee_ready, get_session_id, is_cloud_mode, load_config
+from config import ensure_cognee_ready, get_session_id, load_config
 
 TOP_K = 5
 TRUNCATE_ANSWER = 500
 TRUNCATE_RETURN = 400
 TRUNCATE_GRAPH_CTX = 1500
+RECENT_TRACE_FALLBACK_TOP_K = 5
 
 
 def _load_session_id() -> str:
@@ -97,14 +103,63 @@ def _has_entry_content(entry: dict) -> bool:
     return any(str(entry.get(field, "") or "").strip() for field in fields)
 
 
-async def _run(prompt: str, out_stream=None):
+async def _recent_trace_fallback(session_id: str, user_id: str, top_k: int) -> list[dict]:
+    """Return recent trace rows directly when semantic trace recall misses.
+
+    Tool calls are chronological session context, not only semantic context. A
+    casual next prompt often will not match the words in a tool output, but the
+    agent still needs to see the recent tool calls it just made.
+    """
+    try:
+        from cognee.infrastructure.session.get_session_manager import get_session_manager
+
+        sm = get_session_manager()
+        if not sm.is_available or not user_id:
+            return []
+        raw_trace = await sm.get_agent_trace_session(user_id=user_id, session_id=session_id)
+        entries = list(raw_trace or [])[-top_k:]
+    except Exception as exc:
+        hook_log("trace_fallback_error", {"error": str(exc)[:200]})
+        return []
+
+    normalized: list[dict] = []
+    for entry in entries:
+        if hasattr(entry, "model_dump"):
+            entry = entry.model_dump()
+        elif hasattr(entry, "dict"):
+            entry = entry.dict()
+        elif hasattr(entry, "__dict__"):
+            entry = dict(entry.__dict__)
+        if not isinstance(entry, dict):
+            continue
+        entry["source"] = "trace"
+        if _has_entry_content(entry):
+            normalized.append(entry)
+    return normalized
+
+
+async def _run(prompt: str) -> dict | None:
     config = load_config()
-    await ensure_cognee_ready(config)
+    runtime = resolve_runtime_mode()
+    cloud_mode = runtime["mode"] == "http"
+    hook_log(
+        "mode_decision",
+        {
+            "hook": "session-context-lookup",
+            "mode": runtime["mode"],
+            "service_url": runtime.get("service_url", ""),
+            "url_source": runtime.get("url_source", ""),
+            "key_source": runtime.get("key_source", ""),
+            "api_key_present": runtime.get("api_key_present", False),
+        },
+    )
+    if not cloud_mode:
+        await ensure_cognee_ready(config)
 
     session_id = _load_session_id()
     if not session_id:
         hook_log("no_session_id", {"event": "context_lookup"})
-        return
+        return None
 
     saves_last_turn = read_and_reset_save_counter(session_id)
 
@@ -119,7 +174,6 @@ async def _run(prompt: str, out_stream=None):
         (["graph_context"], None),
         (["graph"], "GRAPH_COMPLETION"),
     ]
-    cloud_mode = is_cloud_mode(config)
     if not cloud_mode:
         import cognee
         from cognee.modules.search.types import SearchType
@@ -172,6 +226,16 @@ async def _run(prompt: str, out_stream=None):
             continue
         by_source.setdefault(src, []).append(r)
 
+    if not cloud_mode and not by_source.get("trace"):
+        fallback_traces = await _recent_trace_fallback(
+            session_id,
+            _load_user_id(),
+            RECENT_TRACE_FALLBACK_TOP_K,
+        )
+        if fallback_traces:
+            by_source["trace"].extend(fallback_traces)
+            hook_log("trace_fallback_hit", {"count": len(fallback_traces)})
+
     counts = {k: len(v) for k, v in by_source.items()}
     total = sum(counts.values())
 
@@ -195,21 +259,19 @@ async def _run(prompt: str, out_stream=None):
             ),
             encoding="utf-8",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("last_recall_write_failed", {"error": str(exc)[:200]})
 
     # Build a one-line visibility header so the user (via the assistant's
     # context) can tell that memory fired on this turn — both what it
     # recalled right now and what the previous turn persisted.
-    recall_tag = (
-        f"🔍 cognee recall: {counts['session']} session / "
-        f"{counts['trace']} trace / {counts['graph_context']} graph-ctx hits"
+    header = (
+        "Cognee memory: recall "
+        f"{counts['session']} session / {counts['trace']} trace / "
+        f"{counts['graph_context']} graph; saved last turn "
+        f"{saves_last_turn['prompt']} prompt / {saves_last_turn['trace']} trace / "
+        f"{saves_last_turn['answer']} answer"
     )
-    saves_tag = (
-        f"💾 saves last turn: {saves_last_turn['prompt']} prompt / "
-        f"{saves_last_turn['trace']} trace / {saves_last_turn['answer']} answer"
-    )
-    header = f"{recall_tag}    |    {saves_tag}"
 
     section_lines = []
     if by_source.get("graph_context"):
@@ -229,21 +291,19 @@ async def _run(prompt: str, out_stream=None):
             section_lines.append("")
 
     if total > 0:
-        context = (
+        full_context = (
             f"{header}\n\nRelevant context from this session's memory:\n\n"
             + "\n".join(section_lines).strip()
         )
         hook_log("context_lookup_hit", {"counts": counts, "saves_last_turn": saves_last_turn})
         notify(f"injected context ({counts}); saves last turn {saves_last_turn}")
     else:
-        context = f"{header}\n\n(no memory matches for this prompt)"
+        full_context = f"{header}\n\n(no memory matches for this prompt)"
         hook_log("context_lookup_empty", {"saves_last_turn": saves_last_turn})
         notify(f"no recall matches; saves last turn {saves_last_turn}")
 
-    # Audit log: persist the full injected context per turn. The Claude Code
-    # JSONL transcript does not preserve UserPromptSubmit additionalContext,
-    # so this file is the source of truth for "what did the plugin give
-    # Claude on prompt X."
+    # Audit log: persist full recall details per turn. The hook output stays a
+    # short summary because Codex renders additionalContext in the terminal.
     try:
         from datetime import datetime as _dt
         from datetime import timezone as _tz
@@ -259,25 +319,22 @@ async def _run(prompt: str, out_stream=None):
                         "session_id": session_id,
                         "prompt": prompt,
                         "hits": counts,
-                        "context": context,
+                        "context": full_context,
                     }
                 )
                 + "\n"
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        hook_log("recall_audit_write_failed", {"error": str(exc)[:200]})
 
     output = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-            # Surfaces the one-line header to the user's terminal (UI),
-            # so they can see that memory fired even though the full
-            # context only goes to the model via additionalContext.
+            "additionalContext": full_context,
             "systemMessage": header,
         }
     }
-    print(json.dumps(output), file=out_stream or sys.stdout)
+    return output
 
 
 def main():
@@ -290,23 +347,28 @@ def main():
     except json.JSONDecodeError:
         return
 
+    session_key_candidate, session_key_source = resolve_session_key_from_payload(payload)
+    if session_key_candidate:
+        set_session_key(session_key_candidate)
+    hook_log(
+        "context_lookup_session_key", {"source": session_key_source, "value": session_key_candidate}
+    )
+    if not get_session_key():
+        hook_log("context_lookup_missing_session_key")
+        return
+
     prompt = payload.get("prompt", "")
     if not prompt or len(prompt) < 5:
         return
 
-    # Claude Code expects pure JSON on stdout. Some cognee codepaths (e.g.
-    # serve registration) print human-facing banners to stdout, which would
-    # otherwise contaminate the hook output and prevent systemMessage from
-    # rendering in the user's terminal. Redirect stdout to stderr for the
-    # cognee call, then write our JSON to the real stdout at the end.
-    real_stdout = sys.stdout
-    sys.stdout = sys.stderr
+    output = None
     try:
-        asyncio.run(_run(prompt, real_stdout))
+        with quiet_hook_output("session-context-lookup"):
+            output = asyncio.run(_run(prompt))
     except Exception as exc:
         hook_log("context_lookup_exception", {"error": str(exc)[:200]})
-    finally:
-        sys.stdout = real_stdout
+    if output:
+        print(json.dumps(output))
 
 
 if __name__ == "__main__":

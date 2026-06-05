@@ -9,21 +9,105 @@
 # No flag:   search session first, then graph if empty
 #
 # Configuration:
-#   Reads resolved session ID and dataset from ~/.cognee-plugin/resolved.json
-#   (written by SessionStart hook). Falls back to env vars.
+#   Resolves session ID and dataset from Cognee endpoints using API auth.
+#   Falls back to env vars when endpoint lookup is unavailable.
 
 set -euo pipefail
 
-RESOLVED_FILE="${HOME}/.cognee-plugin/resolved.json"
+PLUGIN_DIR="${HOME}/.cognee-plugin"
+runtime_json="$(python3 - <<'PY' "${PLUGIN_DIR}" 2>/dev/null || true
+import json
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-# Read resolved config if available, otherwise use env var defaults
-if [ -f "$RESOLVED_FILE" ]; then
-    DATASET=$(python3 -c "import json; print(json.load(open('$RESOLVED_FILE')).get('dataset','claude_sessions'))" 2>/dev/null || echo "claude_sessions")
-    SESSION_ID=$(python3 -c "import json; print(json.load(open('$RESOLVED_FILE')).get('session_id','claude_code_session'))" 2>/dev/null || echo "claude_code_session")
-else
-    DATASET="${COGNEE_PLUGIN_DATASET:-claude_sessions}"
-    SESSION_ID="${COGNEE_SESSION_ID:-claude_code_session}"
-fi
+plugin_dir = pathlib.Path(sys.argv[1])
+import os
+service_url = (os.environ.get("COGNEE_SERVICE_URL") or os.environ.get("COGNEE_LOCAL_API_URL") or "http://localhost:8011").strip()
+api_key = (os.environ.get("COGNEE_API_KEY") or "").strip()
+agent_name = (os.environ.get("COGNEE_AGENT_NAME") or "").strip()
+if agent_name:
+    if agent_name.endswith("@cognee.agent"):
+        agent_name = agent_name[: -len("@cognee.agent")]
+    if not agent_name.endswith("_claude"):
+        agent_name = f"{agent_name}_claude"
+
+if not api_key and service_url and agent_name:
+    cache_path = plugin_dir / "agent_keys.json"
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+            entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+            if isinstance(entries, dict):
+                normalized_url = service_url.rstrip("/")
+                key = f"{normalized_url}::{agent_name}"
+                chosen = entries.get(key)
+                if isinstance(chosen, dict):
+                    api_key = str(chosen.get("api_key") or "").strip()
+                else:
+                    for entry in entries.values():
+                        if not isinstance(entry, dict):
+                            continue
+                        name = str(entry.get("agent_name") or "").strip()
+                        url = str(entry.get("service_url") or "").strip().rstrip("/")
+                        if name == agent_name and url == normalized_url:
+                            api_key = str(entry.get("api_key") or "").strip()
+                            break
+        except Exception:
+            pass
+
+session_id = ""
+dataset = ""
+if service_url and api_key:
+    try:
+        query = ""
+        session_key = (os.environ.get("COGNEE_SESSION_KEY") or "").strip()
+        if session_key:
+            query = "?agent_session_name=" + urllib.parse.quote(session_key, safe="")
+        req = urllib.request.Request(
+            service_url.rstrip("/") + "/api/v1/agents/connections/me" + query,
+            headers={"X-Api-Key": api_key},
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+        if isinstance(payload, dict):
+            agent = payload.get("agent") if isinstance(payload.get("agent"), dict) else {}
+            if isinstance(agent, dict):
+                session_id = str(agent.get("session_id") or "").strip()
+                datasets = agent.get("datasets") if isinstance(agent.get("datasets"), list) else []
+                for item in datasets:
+                    if isinstance(item, dict):
+                        name = str(item.get("name") or "").strip()
+                        if name:
+                            dataset = name
+                            break
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        pass
+
+print(json.dumps({"session_id": session_id, "dataset": dataset}))
+PY
+)"
+
+DATASET="$(python3 - <<'PY' "${runtime_json}" 2>/dev/null || true
+import json, sys
+try:
+    print((json.loads(sys.argv[1] or "{}").get("dataset") or "").strip())
+except Exception:
+    pass
+PY
+)"
+SESSION_ID="$(python3 - <<'PY' "${runtime_json}" 2>/dev/null || true
+import json, sys
+try:
+    print((json.loads(sys.argv[1] or "{}").get("session_id") or "").strip())
+except Exception:
+    pass
+PY
+)"
+[ -z "$DATASET" ] && DATASET="${COGNEE_PLUGIN_DATASET:-claude_sessions}"
+[ -z "$SESSION_ID" ] && SESSION_ID="${COGNEE_SESSION_ID:-claude_session}"
 
 QUERY="${1:-}"
 TOP_K="${2:-5}"

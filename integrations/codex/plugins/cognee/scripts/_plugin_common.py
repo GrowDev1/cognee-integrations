@@ -72,19 +72,29 @@ def set_session_key(session_key: str) -> str:
 
 
 def _resolve_agent_name() -> str:
+    def _normalize(name: str) -> str:
+        raw = str(name or "").strip()
+        if raw.endswith("@cognee.agent"):
+            raw = raw[: -len("@cognee.agent")]
+        suffix = "_codex"
+        if raw.endswith(suffix):
+            return raw
+        return f"{raw}{suffix}"
+
     env_name = str(os.environ.get("COGNEE_AGENT_NAME") or "").strip()
     if env_name:
-        return env_name
+        return _normalize(env_name)
     try:
         from config import load_config  # type: ignore
 
         configured = str(load_config().get("agent_name") or "").strip()
         if configured:
-            os.environ["COGNEE_AGENT_NAME"] = configured
-            return configured
+            normalized = _normalize(configured)
+            os.environ["COGNEE_AGENT_NAME"] = normalized
+            return normalized
     except Exception:
         pass
-    return "codex-agent"
+    return _normalize("codex-agent")
 
 
 def load_resolved(session_key: str = "") -> dict:
