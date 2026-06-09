@@ -35,6 +35,7 @@ from _plugin_common import (
     resolve_runtime_mode,
     resolve_session_key_from_payload,
     resolve_user,
+    server_ready_hint,
     set_session_key,
     touch_activity,
 )
@@ -171,6 +172,12 @@ async def _store_tool_call(payload: dict) -> None:
         },
     )
     if not use_http:
+        # While the server is still warming, skip the blocking local init and
+        # persist so this hook never stalls a tool call. Traces in this brief
+        # window are best-effort; any buffered prompt stays buffered.
+        if not server_ready_hint(runtime.get("service_url", "")):
+            hook_log("store_skipped_warming", {"mode": runtime["mode"]})
+            return
         await ensure_cognee_ready(config)
 
     entry = {
@@ -271,6 +278,12 @@ async def _store_assistant_stop(payload: dict) -> None:
         },
     )
     if not use_http:
+        # While the server is still warming, skip the blocking local init and
+        # persist so this hook never stalls a tool call. Traces in this brief
+        # window are best-effort; any buffered prompt stays buffered.
+        if not server_ready_hint(runtime.get("service_url", "")):
+            hook_log("store_skipped_warming", {"mode": runtime["mode"]})
+            return
         await ensure_cognee_ready(config)
 
     pending = pop_pending_prompt(session_id, turn_id=str(payload.get("turn_id") or ""))

@@ -27,7 +27,9 @@ from _plugin_common import (
     quiet_hook_output,
     remember_pending_prompt,
     resolve_runtime_mode,
+    resolve_session_key_from_payload,
     resolve_user,
+    server_ready_hint,
     set_session_key,
     touch_activity,
 )
@@ -134,9 +136,11 @@ async def _store(prompt: str, payload: dict):
     _ensure_idle_watcher(session_id, dataset, user_id, config)
 
     runtime = resolve_runtime_mode()
-    if runtime["mode"] == "local_sdk":
+    if runtime["mode"] == "local_sdk" and server_ready_hint(runtime.get("service_url", "")):
         # Keep Cognee initialization parity with Claude so fresh local
         # databases, identities, and datasets are ready before Stop writes.
+        # Skipped while the server is still warming so this hook never blocks;
+        # the prompt is still buffered below and flushed once the server is up.
         try:
             await ensure_cognee_ready(config)
             await resolve_user(user_id)
@@ -165,9 +169,10 @@ def main():
         hook_log("invalid_payload_json", {"event": "prompt"})
         return
 
-    payload_session_id = str(payload.get("session_id", "") or "").strip()
-    if payload_session_id:
-        set_session_key(payload_session_id)
+    session_key_candidate, session_key_source = resolve_session_key_from_payload(payload)
+    if session_key_candidate:
+        set_session_key(session_key_candidate)
+    hook_log("prompt_session_key", {"source": session_key_source, "value": session_key_candidate})
     if not get_session_key():
         hook_log("prompt_missing_session_key")
         return

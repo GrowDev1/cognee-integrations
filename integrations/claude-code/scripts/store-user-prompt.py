@@ -29,6 +29,7 @@ from _plugin_common import (
     resolve_runtime_mode,
     resolve_session_key_from_payload,
     resolve_user,
+    server_ready_hint,
     set_session_key,
     touch_activity,
 )
@@ -146,9 +147,11 @@ async def _store(prompt: str, payload: dict):
             "api_key_present": runtime.get("api_key_present", False),
         },
     )
-    if runtime["mode"] == "local_sdk":
+    if runtime["mode"] == "local_sdk" and server_ready_hint(runtime.get("service_url", "")):
         # Keep Cognee initialization parity with Claude so fresh local
         # databases, identities, and datasets are ready before Stop writes.
+        # Skipped while the server is still warming so this hook never blocks;
+        # the prompt is still buffered below and flushed once the server is up.
         try:
             await ensure_cognee_ready(config)
             await resolve_user(user_id)

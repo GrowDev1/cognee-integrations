@@ -33,7 +33,9 @@ from _plugin_common import (
     quiet_hook_output,
     remember_entry_via_http,
     resolve_runtime_mode,
+    resolve_session_key_from_payload,
     resolve_user,
+    server_ready_hint,
     set_session_key,
     touch_activity,
 )
@@ -159,6 +161,12 @@ async def _store_tool_call(payload: dict) -> None:
     runtime = resolve_runtime_mode()
     use_http = runtime["mode"] == "http"
     if not use_http:
+        # While the server is still warming, skip the blocking local init and
+        # persist so this hook never stalls a tool call. Traces in this brief
+        # window are best-effort; any buffered prompt stays buffered.
+        if not server_ready_hint(runtime.get("service_url", "")):
+            hook_log("store_skipped_warming", {"mode": runtime["mode"]})
+            return
         await ensure_cognee_ready(config)
 
     entry = {
@@ -248,6 +256,12 @@ async def _store_assistant_stop(payload: dict) -> None:
     runtime = resolve_runtime_mode()
     use_http = runtime["mode"] == "http"
     if not use_http:
+        # While the server is still warming, skip the blocking local init and
+        # persist so this hook never stalls a tool call. Traces in this brief
+        # window are best-effort; any buffered prompt stays buffered.
+        if not server_ready_hint(runtime.get("service_url", "")):
+            hook_log("store_skipped_warming", {"mode": runtime["mode"]})
+            return
         await ensure_cognee_ready(config)
 
     pending = pop_pending_prompt(session_id, turn_id=str(payload.get("turn_id") or ""))
@@ -317,9 +331,10 @@ def main():
         hook_log("invalid_payload_json")
         return
 
-    payload_session_id = str(payload.get("session_id", "") or "").strip()
-    if payload_session_id:
-        set_session_key(payload_session_id)
+    session_key_candidate, session_key_source = resolve_session_key_from_payload(payload)
+    if session_key_candidate:
+        set_session_key(session_key_candidate)
+    hook_log("store_session_key", {"source": session_key_source, "value": session_key_candidate})
     if not get_session_key():
         hook_log("store_missing_session_key")
         return

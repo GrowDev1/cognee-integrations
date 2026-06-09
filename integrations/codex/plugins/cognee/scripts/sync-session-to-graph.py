@@ -10,6 +10,7 @@ Configuration:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -27,6 +28,7 @@ from _plugin_common import (
     http_api_ready,
     load_resolved,
     persist_session_cache_to_graph_via_http,
+    resolve_session_key_from_payload,
     resolve_user,
     resolved_http_endpoint_auth,
     set_session_key,
@@ -48,6 +50,8 @@ _WATCHER_PID = _STATE_DIR / "watcher.pid"
 _WATCHER_STOP = _STATE_DIR / "watcher.stop"
 _DETACHED_ARG = "--detached-final"
 _SESSION_END_ARG = "--session-end"
+_FINAL_SYNC_ONCE_DIR = _STATE_DIR / "final-sync-once"
+_FINAL_SYNC_ONCE_TTL_SECONDS = 3600
 _DETACHED_RETRIES_DEFAULT = 3
 _DETACHED_RETRY_DELAY_DEFAULT = 10.0
 _SESSION_END_START_DELAY_DEFAULT = 2.0
@@ -92,6 +96,71 @@ def _spawn_detached_sync() -> bool:
     except Exception as exc:
         hook_log("sync_detach_failed", {"error": str(exc)[:300]})
         return False
+
+
+def _final_sync_identity() -> tuple[str, str]:
+    """Return a stable per-session token for detached final sync dedupe."""
+    session_key = str(os.environ.get("COGNEE_SESSION_KEY", "") or "").strip()
+    if session_key:
+        return session_key, "COGNEE_SESSION_KEY"
+    session_id = str(os.environ.get("COGNEE_SYNC_SESSION_ID", "") or "").strip()
+    if session_id:
+        return session_id, "COGNEE_SYNC_SESSION_ID"
+    return "", "missing"
+
+
+def _claim_final_sync_once() -> bool:
+    """Allow exactly one detached final sync worker per session."""
+    _prune_final_sync_markers()
+
+    token, source = _final_sync_identity()
+    if not token:
+        # No stable identity available; do not risk skipping final sync.
+        hook_log("final_sync_once_no_token", {"source": source})
+        return True
+
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()
+    marker = _FINAL_SYNC_ONCE_DIR / f"{digest}.done"
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token)
+        hook_log("final_sync_once_claimed", {"source": source, "marker": str(marker)})
+        return True
+    except FileExistsError:
+        hook_log("final_sync_once_already_claimed", {"source": source, "marker": str(marker)})
+        return False
+    except Exception as exc:
+        # On marker failure, prefer proceeding to avoid data loss.
+        hook_log("final_sync_once_claim_failed", {"source": source, "error": str(exc)[:200]})
+        return True
+
+
+def _prune_final_sync_markers() -> None:
+    """Delete stale detached-sync dedupe markers older than configured TTL."""
+    try:
+        if not _FINAL_SYNC_ONCE_DIR.exists():
+            return
+        now = time.time()
+        removed = 0
+        for path in _FINAL_SYNC_ONCE_DIR.glob("*.done"):
+            try:
+                age = now - path.stat().st_mtime
+                if age > _FINAL_SYNC_ONCE_TTL_SECONDS:
+                    path.unlink()
+                    removed += 1
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        if removed:
+            hook_log(
+                "final_sync_once_pruned",
+                {"removed": removed, "ttl_seconds": _FINAL_SYNC_ONCE_TTL_SECONDS},
+            )
+    except Exception as exc:
+        hook_log("final_sync_once_prune_failed", {"error": str(exc)[:200]})
 
 
 def _is_session_end_payload(payload_raw: str) -> bool:
@@ -277,9 +346,10 @@ def main():
             payload = json.loads(payload_raw)
         except json.JSONDecodeError:
             payload = {}
-        session_key_candidate = str(payload.get("session_id", "") or "").strip()
+        session_key_candidate, session_key_source = resolve_session_key_from_payload(payload)
         if session_key_candidate:
             set_session_key(session_key_candidate)
+        hook_log("sync_session_key", {"source": session_key_source, "value": session_key_candidate})
     is_session_end = forced_session_end or _is_session_end_payload(payload_raw)
     hook_log(
         "sync_payload",
@@ -300,6 +370,9 @@ def main():
         if delay > 0:
             hook_log("sync_start_delayed", {"seconds": delay})
             time.sleep(delay)
+        if not _claim_final_sync_once():
+            hook_log("sync_detached_skipped_duplicate")
+            return
 
     unregister_on_finish = detached_final and os.environ.get(
         "COGNEE_UNREGISTER_ON_FINISH", ""

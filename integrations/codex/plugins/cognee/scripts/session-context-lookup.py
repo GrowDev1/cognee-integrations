@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -22,15 +23,27 @@ from _plugin_common import (
     get_session_key,
     hook_log,
     load_resolved,
+    mark_server_ready,
     notify,
     quiet_hook_output,
     read_and_reset_save_counter,
     recall_via_http,
     resolve_runtime_mode,
+    resolve_session_key_from_payload,
     resolve_user,
+    server_health_ok,
+    server_ready_hint,
     set_session_key,
 )
 from config import ensure_cognee_ready, get_session_id, load_config
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
 
 TOP_K = 5
 TRUNCATE_ANSWER = 500
@@ -141,6 +154,18 @@ async def _run(prompt: str) -> dict | None:
     config = load_config()
     runtime = resolve_runtime_mode()
     cloud_mode = runtime["mode"] == "http"
+    # Readiness gate: never block the user's prompt on a warming/migrating
+    # backend. Trust a fresh readiness marker (zero-network); on a miss, do one
+    # short /health probe and record the result. If still not ready, skip recall
+    # entirely so the prompt is answered at full speed (memory turns on later).
+    service_url = runtime.get("service_url", "")
+    if not server_ready_hint(service_url):
+        if server_health_ok(service_url, timeout=_float_env("COGNEE_READY_PROBE_TIMEOUT", 1.0)):
+            mark_server_ready(service_url)
+        else:
+            hook_log("recall_skipped_warming", {"service_url": service_url})
+            return None
+
     if not cloud_mode:
         await ensure_cognee_ready(config)
 
@@ -168,7 +193,15 @@ async def _run(prompt: str) -> dict | None:
 
         user = await resolve_user(_load_user_id())
 
+    # Hard time-box: this hook is on the keystroke->answer path, so recall must
+    # never be the long pole. Each scope gets a short per-call timeout, and the
+    # whole loop stops once the overall budget is spent. Partial results are fine.
+    recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 2.5)
+    budget_deadline = time.monotonic() + _float_env("COGNEE_RECALL_BUDGET", 4.0)
     for scope_list, qtype in scope_specs:
+        if time.monotonic() >= budget_deadline:
+            hook_log("recall_budget_exceeded", {"collected": len(results)})
+            break
         try:
             if cloud_mode:
                 part = recall_via_http(
@@ -178,17 +211,21 @@ async def _run(prompt: str) -> dict | None:
                     scope=scope_list,
                     only_context=True,
                     search_type=qtype,
+                    timeout=recall_timeout,
                 )
             else:
                 query_type = SearchType.GRAPH_COMPLETION if qtype == "GRAPH_COMPLETION" else None
-                part = await cognee.recall(
-                    prompt,
-                    session_id=session_id,
-                    top_k=TOP_K,
-                    scope=scope_list,
-                    only_context=True,
-                    query_type=query_type,
-                    user=user,
+                part = await asyncio.wait_for(
+                    cognee.recall(
+                        prompt,
+                        session_id=session_id,
+                        top_k=TOP_K,
+                        scope=scope_list,
+                        only_context=True,
+                        query_type=query_type,
+                        user=user,
+                    ),
+                    timeout=recall_timeout,
                 )
             if part:
                 results.extend(part)
@@ -334,9 +371,12 @@ def main():
     except json.JSONDecodeError:
         return
 
-    payload_session_id = str(payload.get("session_id", "") or "").strip()
-    if payload_session_id:
-        set_session_key(payload_session_id)
+    session_key_candidate, session_key_source = resolve_session_key_from_payload(payload)
+    if session_key_candidate:
+        set_session_key(session_key_candidate)
+    hook_log(
+        "context_lookup_session_key", {"source": session_key_source, "value": session_key_candidate}
+    )
     if not get_session_key():
         hook_log("context_lookup_missing_session_key")
         return

@@ -180,17 +180,24 @@ try:
     t = int(h.get("trace", 0))
     g = int(h.get("graph_context", 0))
     total = s + t + g
-    icon = "🔍" if total else "·"
-    print(f"{icon} recall: {s}s/{t}t/{g}g")
+    print(f"recall: {s}s/{t}t/{g}g")
 except Exception:
     pass
 PY
 )
 fi
 
+# Warming indicator — an absent server-ready marker means the local Cognee
+# server is still booting/migrating; recall is paused until it comes up.
+warming=""
+if [ ! -e "${HOME}/.cognee-plugin/server-ready.json" ]; then
+    warming="cognee: warming"
+fi
+
 # Compose. Drop empty segments cleanly.
 parts=()
 parts+=("$static")
+[ -n "$warming" ] && parts+=("$warming")
 [ -n "$recall" ] && parts+=("$recall")
 [ -n "$saves" ] && parts+=("$saves")
 

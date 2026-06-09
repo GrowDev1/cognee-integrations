@@ -24,6 +24,8 @@ _COUNTER_FILE = _PLUGIN_DIR / "counter.json"
 _ACTIVITY_FILE = _PLUGIN_DIR / "activity.ts"
 _ACTIVITY_LOG = _PLUGIN_DIR / "activity.log"
 _SAVE_COUNTER = _PLUGIN_DIR / "save_counter.json"
+_SERVER_READY_MARKER = Path.home() / ".cognee-plugin" / "server-ready.json"
+_SERVER_READY_TTL_SECONDS = 30
 _SYNC_LOCK = _PLUGIN_DIR / "sync.lock"
 _HTTP_BRIDGE_CACHE = _PLUGIN_DIR / "http_bridge_cache.json"
 _HTTP_BRIDGE_STATE = _PLUGIN_DIR / "http_bridge_state.json"
@@ -69,6 +71,42 @@ def set_session_key(session_key: str) -> str:
     if normalized:
         os.environ["COGNEE_SESSION_KEY"] = normalized
     return normalized
+
+
+def resolve_session_key_from_payload(payload: dict) -> tuple[str, str]:
+    """Resolve session key from a hook payload using known host variants."""
+    if not isinstance(payload, dict):
+        return "", "missing_payload"
+
+    def _read_path(obj: dict, path: list[str]) -> str:
+        cur = obj
+        for key in path[:-1]:
+            nxt = cur.get(key)
+            if not isinstance(nxt, dict):
+                return ""
+            cur = nxt
+        value = cur.get(path[-1])
+        return str(value or "").strip() if value is not None else ""
+
+    candidates: list[tuple[str, list[str]]] = [
+        ("payload.session_id", ["session_id"]),
+        ("payload.sessionId", ["sessionId"]),
+        ("payload.session.id", ["session", "id"]),
+        ("payload.conversation_id", ["conversation_id"]),
+        ("payload.conversationId", ["conversationId"]),
+        ("payload.conversation.id", ["conversation", "id"]),
+        ("payload.chat_id", ["chat_id"]),
+        ("payload.chatId", ["chatId"]),
+        ("payload.thread_id", ["thread_id"]),
+        ("payload.threadId", ["threadId"]),
+        ("payload.transcript.session_id", ["transcript", "session_id"]),
+        ("payload.transcript.sessionId", ["transcript", "sessionId"]),
+    ]
+    for source, path in candidates:
+        value = _read_path(payload, path)
+        if value:
+            return value, source
+    return "", "not_found"
 
 
 def _resolve_agent_name() -> str:
@@ -572,6 +610,77 @@ def http_api_ready() -> bool:
     return bool(service_url and api_key)
 
 
+def server_health_ok(service_url: str = "", timeout: float = 1.0) -> bool:
+    """Return True iff GET {service_url}/health responds 200 (server serving).
+
+    The Cognee server runs migrations in its FastAPI lifespan *before* it
+    serves, so a 200 here reliably means migrations are done and the DBs are
+    reachable.
+    """
+    base = _normalize_service_url(service_url or _local_api_url())
+    if not base:
+        return False
+    try:
+        with urllib.request.urlopen(f"{base}/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def mark_server_ready(service_url: str, version: str = "") -> None:
+    """Record that the local Cognee server is healthy and serving.
+
+    Global (not namespaced) because Claude and Codex share one server on the
+    same port. Read by hot-path hooks via ``server_ready_hint`` to decide
+    whether to attempt recall without paying a network probe.
+    """
+    try:
+        _SERVER_READY_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "service_url": _normalize_service_url(service_url),
+            "ready_at": datetime.now(timezone.utc).timestamp(),
+            "version": str(version or ""),
+        }
+        tmp = _SERVER_READY_MARKER.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, _SERVER_READY_MARKER)
+    except Exception as exc:
+        hook_log("server_ready_mark_failed", {"error": str(exc)[:200]})
+
+
+def clear_server_ready() -> None:
+    """Drop the readiness marker (e.g. after a failed health re-probe)."""
+    try:
+        _SERVER_READY_MARKER.unlink()
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        hook_log("server_ready_clear_failed", {"error": str(exc)[:200]})
+
+
+def server_ready_hint(service_url: str = "") -> bool:
+    """Zero-network readiness check for the hot path.
+
+    True iff a readiness marker exists, is within TTL, and (if given) matches
+    the service URL. A stale/missing marker returns False so recall fast-skips
+    while the server is still warming.
+    """
+    try:
+        raw = json.loads(_SERVER_READY_MARKER.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+    ready_at = float(raw.get("ready_at", 0) or 0)
+    if datetime.now(timezone.utc).timestamp() - ready_at > _SERVER_READY_TTL_SECONDS:
+        return False
+    if service_url:
+        marked = _normalize_service_url(raw.get("service_url", ""))
+        if marked and marked != _normalize_service_url(service_url):
+            return False
+    return True
+
+
 def resolve_runtime_mode() -> dict:
     """Resolve hook runtime mode from effective endpoint auth."""
     service_url, api_key = resolved_http_endpoint_auth()
@@ -700,7 +809,7 @@ def recall_via_http(
     scope: list[str],
     only_context: bool = True,
     search_type: str | None = None,
-    timeout: float = 60.0,
+    timeout: float = 10.0,
 ) -> list:
     payload = {
         "query": query,

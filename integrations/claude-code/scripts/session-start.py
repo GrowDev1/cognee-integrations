@@ -10,6 +10,7 @@ Runs on the SessionStart hook. Responsibilities:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -27,8 +28,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
     hook_log,
+    mark_server_ready,
     quiet_hook_output,
     resolve_session_key_from_payload,
+    server_health_ok,
+    server_ready_hint,
     set_session_key,
     touch_activity,
 )
@@ -45,6 +49,7 @@ from config import (
 )
 
 _STATE_DIR = Path.home() / ".cognee-plugin"
+_GLOBAL_STATE_DIR = Path.home() / ".cognee-plugin"
 _WATCHER_PID = _STATE_DIR / "watcher.pid"
 _WATCHER_STOP = _STATE_DIR / "watcher.stop"
 _WATCHER_SCRIPT = Path(__file__).with_name("idle-watcher.py")
@@ -55,10 +60,30 @@ _AGENT_KEYS_LOCK = _STATE_DIR / "agent_keys.lock"
 _AGENT_KEYS_LOCK_STALE_SECONDS = 120
 _AGENT_KEYS_LOCK_WAIT_SECONDS = 4.0
 _AGENT_KEYS_LOCK_POLL_SECONDS = 0.05
+_AGENT_LIFECYCLE_LOCKS_DIR = _STATE_DIR / "agent_lifecycle_locks"
+_AGENT_LIFECYCLE_LOCK_STALE_SECONDS = 120
+_AGENT_LIFECYCLE_LOCK_WAIT_SECONDS = 20.0
+_AGENT_LIFECYCLE_LOCK_POLL_SECONDS = 0.05
 _LOCAL_SERVICE_URL = "http://localhost:8011"
 _HEALTH_URL = f"{_LOCAL_SERVICE_URL}/health"
 _HEALTH_TIMEOUT_SECONDS = 30
 _HEALTH_POLL_SECONDS = 1.0
+_SERVER_BOOT_LOCK = _GLOBAL_STATE_DIR / "server-bootstrap.lock"
+_SERVER_BOOT_LOCK_STALE_SECONDS = 2 * _HEALTH_TIMEOUT_SECONDS
+_SERVER_BOOT_LOCK_WAIT_SECONDS = _HEALTH_TIMEOUT_SECONDS + 5.0
+_SERVER_BOOT_LOCK_POLL_SECONDS = 0.2
+
+# Lazy bootstrap: defer server boot + registration to a detached worker so the
+# SessionStart hook returns fast and migrations never time out the 15s budget.
+_BOOTSTRAP_ARG = "--bootstrap"
+_BOOTSTRAP_LOCK = _GLOBAL_STATE_DIR / "server-bootstrap-worker.lock"
+_SERVER_BOOT_DEADLINE_SECONDS = float(os.environ.get("COGNEE_SERVER_BOOT_DEADLINE", "") or 600.0)
+_BOOTSTRAP_LOCK_STALE_SECONDS = _SERVER_BOOT_DEADLINE_SECONDS + 60.0
+_LAZY_BOOTSTRAP = os.environ.get("COGNEE_LAZY_BOOTSTRAP", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 
 def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
@@ -69,30 +94,85 @@ def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
         return False
 
 
-def _ensure_local_server_running(config: dict) -> None:
+def _ensure_local_server_running(
+    config: dict, health_timeout: float = _HEALTH_TIMEOUT_SECONDS
+) -> None:
     if _health_ok():
         config["service_url"] = _LOCAL_SERVICE_URL
         os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
         return
 
-    server_env = os.environ.copy()
-    subprocess.Popen(
-        ["uvicorn", "cognee.api.client:app", "--port", "8011"],
-        env=server_env,
-        start_new_session=True,
-    )
+    owner = f"session-start:{os.getpid()}"
+    acquired = False
+    deadline = time.monotonic() + _SERVER_BOOT_LOCK_WAIT_SECONDS
+    try:
+        _SERVER_BOOT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            now = time.time()
+            if _SERVER_BOOT_LOCK.exists():
+                stale = False
+                try:
+                    raw = json.loads(_SERVER_BOOT_LOCK.read_text(encoding="utf-8"))
+                    pid = int(raw.get("pid", 0) or 0)
+                    created_at = float(raw.get("created_at", 0) or 0)
+                    stale = (not _pid_alive(pid)) or (
+                        now - created_at > _SERVER_BOOT_LOCK_STALE_SECONDS
+                    )
+                except Exception:
+                    stale = True
+                if stale:
+                    try:
+                        _SERVER_BOOT_LOCK.unlink()
+                        hook_log("server_bootstrap_lock_stale_reaped", {"owner": owner})
+                    except Exception as exc:
+                        hook_log("server_bootstrap_lock_unlink_failed", {"error": str(exc)[:200]})
 
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
+            try:
+                fd = os.open(str(_SERVER_BOOT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
+                acquired = True
+                hook_log("server_bootstrap_lock_acquired", {"owner": owner})
+                break
+            except FileExistsError:
+                if _health_ok():
+                    config["service_url"] = _LOCAL_SERVICE_URL
+                    os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+                    return
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("server bootstrap lock timeout")
+                time.sleep(_SERVER_BOOT_LOCK_POLL_SECONDS)
+
         if _health_ok():
             config["service_url"] = _LOCAL_SERVICE_URL
             os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
             return
-        time.sleep(_HEALTH_POLL_SECONDS)
 
-    raise RuntimeError(
-        f"Cognee server did not become healthy at {_HEALTH_URL} within {_HEALTH_TIMEOUT_SECONDS}s"
-    )
+        server_env = os.environ.copy()
+        subprocess.Popen(
+            ["uvicorn", "cognee.api.client:app", "--port", "8011"],
+            env=server_env,
+            start_new_session=True,
+        )
+
+        health_deadline = time.monotonic() + health_timeout
+        while time.monotonic() < health_deadline:
+            if _health_ok():
+                config["service_url"] = _LOCAL_SERVICE_URL
+                os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+                return
+            time.sleep(_HEALTH_POLL_SECONDS)
+
+        raise RuntimeError(
+            f"Cognee server did not become healthy at {_HEALTH_URL} within {health_timeout}s"
+        )
+    finally:
+        if acquired:
+            try:
+                _SERVER_BOOT_LOCK.unlink()
+                hook_log("server_bootstrap_lock_released", {"owner": owner})
+            except Exception as exc:
+                hook_log("server_bootstrap_lock_release_failed", {"error": str(exc)[:200]})
 
 
 def _load_agent_keys_cache() -> dict:
@@ -186,6 +266,57 @@ def _agent_cache_key(service_url: str, agent_name: str) -> str:
 
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _agent_lifecycle_lock_path(service_url: str, agent_name: str) -> Path:
+    lock_key = _agent_cache_key(service_url, agent_name)
+    digest = hashlib.sha256(lock_key.encode("utf-8")).hexdigest()[:32]
+    return _AGENT_LIFECYCLE_LOCKS_DIR / f"{digest}.lock"
+
+
+@contextmanager
+def _agent_lifecycle_lock(service_url: str, agent_name: str, owner: str):
+    acquired = False
+    lock_path = _agent_lifecycle_lock_path(service_url, agent_name)
+    deadline = time.monotonic() + _AGENT_LIFECYCLE_LOCK_WAIT_SECONDS
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            now = time.time()
+            if lock_path.exists():
+                stale = False
+                try:
+                    raw = json.loads(lock_path.read_text(encoding="utf-8"))
+                    pid = int(raw.get("pid", 0) or 0)
+                    created_at = float(raw.get("created_at", 0) or 0)
+                    stale = (not _pid_alive(pid)) or (
+                        now - created_at > _AGENT_LIFECYCLE_LOCK_STALE_SECONDS
+                    )
+                except Exception:
+                    stale = True
+                if stale:
+                    try:
+                        lock_path.unlink()
+                    except Exception as exc:
+                        hook_log("agent_lifecycle_lock_unlink_failed", {"error": str(exc)[:200]})
+
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
+                acquired = True
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("agent lifecycle lock timeout")
+                time.sleep(_AGENT_LIFECYCLE_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_path.unlink()
+            except Exception as exc:
+                hook_log("agent_lifecycle_lock_release_failed", {"error": str(exc)[:200]})
 
 
 async def _login_default_user_for_owner_api_key(service_url: str, config: dict) -> str:
@@ -362,8 +493,10 @@ async def _ensure_agent_credentials_and_register(
     cache_key = _agent_cache_key(service_url, agent_name)
     agent_id = ""
     agent_api_key = ""
-
-    try:
+    registered = False
+    registration: dict = {}
+    lifecycle_owner = f"session-start:lifecycle:{os.getpid()}"
+    with _agent_lifecycle_lock(service_url, agent_name, lifecycle_owner):
         with _agent_keys_lock("session-start:read"):
             cache = _load_agent_keys_cache()
             entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
@@ -375,24 +508,16 @@ async def _ensure_agent_credentials_and_register(
                 entries[cache_key] = cached
                 cache["entries"] = entries
                 _save_agent_keys_cache(cache)
-    except RuntimeError:
-        hook_log("agent_keys_lock_busy", {"stage": "read", "agent_name": agent_name})
-        cache = _load_agent_keys_cache()
-        entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-        cached = entries.get(cache_key, {}) if isinstance(entries, dict) else {}
-        agent_id = str(cached.get("agent_id", "") or "")
-        agent_api_key = str(cached.get("api_key", "") or "")
 
-    if agent_api_key:
-        key_valid = await _agent_api_key_is_valid(service_url, agent_api_key)
-        if not key_valid:
-            hook_log(
-                "agent_key_stale_detected",
-                {"agent_name": agent_name, "service_url": service_url},
-            )
-            agent_id = ""
-            agent_api_key = ""
-            try:
+        if agent_api_key:
+            key_valid = await _agent_api_key_is_valid(service_url, agent_api_key)
+            if not key_valid:
+                hook_log(
+                    "agent_key_stale_detected",
+                    {"agent_name": agent_name, "service_url": service_url},
+                )
+                agent_id = ""
+                agent_api_key = ""
                 with _agent_keys_lock("session-start:invalidate-stale"):
                     cache = _load_agent_keys_cache()
                     entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
@@ -400,10 +525,7 @@ async def _ensure_agent_credentials_and_register(
                         entries.pop(cache_key, None)
                         cache["entries"] = entries
                         _save_agent_keys_cache(cache)
-            except RuntimeError:
-                hook_log("agent_keys_lock_busy", {"stage": "invalidate", "agent_name": agent_name})
-        else:
-            try:
+            else:
                 with _agent_keys_lock("session-start:touch-last-used"):
                     cache = _load_agent_keys_cache()
                     entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
@@ -413,26 +535,21 @@ async def _ensure_agent_credentials_and_register(
                         entries[cache_key] = latest
                         cache["entries"] = entries
                         _save_agent_keys_cache(cache)
-            except RuntimeError:
-                hook_log(
-                    "agent_keys_lock_busy", {"stage": "touch-last-used", "agent_name": agent_name}
-                )
 
-    created_agent_id = ""
-    created_key = ""
-    if not agent_api_key:
-        bootstrap_key = str(
-            config.get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")
-        ).strip()
-        if not bootstrap_key:
-            bootstrap_key = await _login_default_user_for_owner_api_key(service_url, config)
-        created_agent_id, created_key = await _create_agent_with_bootstrap_key(
-            service_url, agent_name, bootstrap_key
-        )
-        if created_key:
-            agent_id = created_agent_id
-            agent_api_key = created_key
-            try:
+        created_agent_id = ""
+        created_key = ""
+        if not agent_api_key:
+            bootstrap_key = str(
+                config.get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")
+            ).strip()
+            if not bootstrap_key:
+                bootstrap_key = await _login_default_user_for_owner_api_key(service_url, config)
+            created_agent_id, created_key = await _create_agent_with_bootstrap_key(
+                service_url, agent_name, bootstrap_key
+            )
+            if created_key:
+                agent_id = created_agent_id
+                agent_api_key = created_key
                 with _agent_keys_lock("session-start:write"):
                     cache = _load_agent_keys_cache()
                     entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
@@ -454,27 +571,25 @@ async def _ensure_agent_credentials_and_register(
                         }
                     cache["entries"] = entries
                     _save_agent_keys_cache(cache)
-            except RuntimeError:
-                hook_log("agent_keys_lock_busy", {"stage": "write", "agent_name": agent_name})
 
-    if not agent_api_key:
-        return "", "", agent_name, False
+        if not agent_api_key:
+            return "", "", agent_name, False
 
-    os.environ["COGNEE_API_KEY"] = agent_api_key
-    config["api_key"] = agent_api_key
+        os.environ["COGNEE_API_KEY"] = agent_api_key
+        config["api_key"] = agent_api_key
 
-    from _plugin_common import register_agent_via_http
+        from _plugin_common import register_agent_via_http
 
-    registered, registration = register_agent_via_http(
-        agent_session_name=agent_session_name,
-        session_id=session_id,
-        dataset_names=[str(config.get("dataset", "") or "").strip()],
-    )
-    if not registered:
-        raise RuntimeError(
-            f"Failed to register agent '{agent_name}' on {service_url}. "
-            "Cached key may be invalid. Delete and recreate the agent."
+        registered, registration = register_agent_via_http(
+            agent_session_name=agent_session_name,
+            session_id=session_id,
+            dataset_names=[str(config.get("dataset", "") or "").strip()],
         )
+        if not registered:
+            raise RuntimeError(
+                f"Failed to register agent '{agent_name}' on {service_url}. "
+                "Cached key may be invalid. Delete and recreate the agent."
+            )
     hook_log(
         "agent_register_result",
         {
@@ -713,6 +828,252 @@ def _purge_legacy_resolved_files() -> None:
         hook_log("legacy_resolved_dir_remove_failed", {"error": str(exc)[:200]})
 
 
+@contextmanager
+def _bootstrap_singleflight():
+    """Allow exactly one detached bootstrap worker at a time (machine-wide).
+
+    The marker is global because Claude and Codex share one local server, so
+    only one of them should drive the boot + migration at any moment.
+    """
+    acquired = False
+    try:
+        _BOOTSTRAP_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        if _BOOTSTRAP_LOCK.exists():
+            stale = False
+            try:
+                raw = json.loads(_BOOTSTRAP_LOCK.read_text(encoding="utf-8"))
+                pid = int(raw.get("pid", 0) or 0)
+                created_at = float(raw.get("created_at", 0) or 0)
+                stale = (not _pid_alive(pid)) or (now - created_at > _BOOTSTRAP_LOCK_STALE_SECONDS)
+            except Exception:
+                stale = True
+            if stale:
+                try:
+                    _BOOTSTRAP_LOCK.unlink()
+                except Exception as exc:
+                    hook_log("bootstrap_lock_unlink_failed", {"error": str(exc)[:200]})
+        try:
+            fd = os.open(str(_BOOTSTRAP_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"pid": os.getpid(), "created_at": now}, fh)
+            acquired = True
+        except FileExistsError:
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                _BOOTSTRAP_LOCK.unlink()
+            except Exception as exc:
+                hook_log("bootstrap_lock_release_failed", {"error": str(exc)[:200]})
+
+
+def _spawn_bootstrap(
+    config: dict,
+    cwd: str,
+    session_id: str,
+    agent_session_name: str,
+    session_key: str,
+    dataset: str,
+) -> None:
+    """Launch the detached server-bootstrap worker (this script, --bootstrap)."""
+    bootstrap = {
+        "cwd": cwd,
+        "session_id": session_id,
+        "session_key": session_key,
+        "dataset": dataset,
+        "agent_session_name": agent_session_name,
+        "service_url": str(config.get("service_url", "") or _LOCAL_SERVICE_URL),
+    }
+    log_path = _STATE_DIR / "bootstrap.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = log_path.open("a", encoding="utf-8")
+    except Exception as exc:
+        hook_log("bootstrap_log_open_failed", {"error": str(exc)[:200]})
+        log_fh = subprocess.DEVNULL
+    try:
+        env = os.environ.copy()
+        if session_key:
+            env["COGNEE_SESSION_KEY"] = session_key
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), _BOOTSTRAP_ARG, json.dumps(bootstrap)],
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        hook_log("bootstrap_spawned", {"session_id": session_id})
+    except Exception as exc:
+        hook_log("bootstrap_spawn_failed", {"error": str(exc)[:300]})
+
+
+async def _run_heavy(
+    config: dict,
+    cwd: str,
+    session_id: str,
+    agent_session_name: str,
+    session_key: str,
+    dataset: str,
+    *,
+    managed_endpoint: bool,
+    boot_timeout: float,
+) -> tuple[str, str, bool]:
+    """Slow session bootstrap shared by the inline (legacy) path and the
+    detached worker: server boot wait, cognee init, agent registration, dataset
+    creation, and the server-ready marker.
+
+    Returns ``(user_id, agent_api_key, ok)``. ``ok`` is False only on a hard
+    cloud-registration failure (mirrors the legacy early-abort).
+    """
+    if not managed_endpoint:
+        try:
+            _ensure_local_server_running(config, health_timeout=boot_timeout)
+        except Exception as exc:
+            hook_log("server_bootstrap_warning", {"error": str(exc)[:200]})
+
+    # Configure cognee (cloud or local)
+    try:
+        await ensure_cognee_ready(config)
+    except Exception as e:
+        print(f"cognee-plugin: init warning ({e})", file=sys.stderr)
+
+    # Register agent identity.
+    user_id = ""
+    agent_api_key = ""
+    agent_id = ""
+    agent_name = _resolve_agent_name(config, cwd)
+    os.environ["COGNEE_AGENT_NAME"] = agent_name
+
+    # Preferred HTTP path: create/get named agent, use its API key,
+    # and register this session in agent-mode.
+    if is_cloud_mode(config):
+        try:
+            (
+                agent_id,
+                agent_api_key,
+                agent_name,
+                _registered,
+            ) = await _ensure_agent_credentials_and_register(
+                config, cwd, session_id, agent_session_name, session_key
+            )
+            if agent_id:
+                user_id = agent_id
+        except Exception as exc:
+            message = str(exc)[:300]
+            hook_log("agent_lifecycle_error", {"error": message})
+            print(f"cognee-plugin: agent lifecycle failed ({message})", file=sys.stderr)
+            return "", "", False
+    else:
+        # Local SDK fallback path.
+        try:
+            if not user_id:
+                user_id, fallback_key = await ensure_identity(config)
+                if fallback_key and not agent_api_key:
+                    agent_api_key = fallback_key
+        except Exception as e:
+            print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
+
+    try:
+        if user_id and is_cloud_mode(config):
+            await ensure_dataset_ready_via_api(
+                config.get("service_url", ""),
+                agent_api_key or config.get("api_key", ""),
+                dataset,
+            )
+        elif user_id:
+            from uuid import UUID
+
+            from cognee.modules.users.methods import get_user
+
+            user = await get_user(UUID(user_id))
+            await ensure_dataset_ready(dataset, user)
+    except Exception as e:
+        print(f"cognee-plugin: dataset warning ({e})", file=sys.stderr)
+    if user_id:
+        os.environ["COGNEE_USER_ID"] = user_id
+
+    # Mark the server ready so hot-path recall can engage — only once it is
+    # actually serving (or managed) so we never advertise a half-migrated DB.
+    service_url = _normalize_service_url(str(config.get("service_url", "") or ""))
+    if not service_url and not managed_endpoint:
+        service_url = _LOCAL_SERVICE_URL
+    if service_url and (managed_endpoint or server_health_ok(service_url, timeout=1.5)):
+        mark_server_ready(service_url)
+
+    return user_id, agent_api_key, True
+
+
+async def _run_bootstrap(bootstrap: dict) -> None:
+    """Detached worker body: do the slow bootstrap under a single-flight lock."""
+    service_url = str(bootstrap.get("service_url", "") or _LOCAL_SERVICE_URL)
+    if server_ready_hint(service_url):
+        hook_log("bootstrap_skip_already_ready", {"service_url": service_url})
+        return
+    with _bootstrap_singleflight() as acquired:
+        if not acquired:
+            hook_log("bootstrap_skip_inflight", {"service_url": service_url})
+            return
+        if server_ready_hint(service_url):
+            return
+        config = load_config()
+        cwd = str(bootstrap.get("cwd") or os.getcwd())
+        session_id = str(bootstrap.get("session_id", "") or "")
+        session_key = str(bootstrap.get("session_key", "") or "")
+        dataset = str(bootstrap.get("dataset", "") or get_dataset(config))
+        agent_session_name = str(bootstrap.get("agent_session_name", "") or session_key)
+        if session_key:
+            os.environ["COGNEE_SESSION_KEY"] = session_key
+        os.environ["COGNEE_AGENT_MODE"] = "true"
+        config["service_url"] = _LOCAL_SERVICE_URL
+        os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+        try:
+            await _run_heavy(
+                config,
+                cwd,
+                session_id,
+                agent_session_name,
+                session_key,
+                dataset,
+                managed_endpoint=False,
+                boot_timeout=_SERVER_BOOT_DEADLINE_SECONDS,
+            )
+            hook_log("bootstrap_complete", {"session_id": session_id})
+        except Exception as exc:
+            hook_log("bootstrap_failed", {"error": str(exc)[:300]})
+
+
+def _session_start_guidance(mode: str, dataset: str, session_id: str, ready: bool) -> dict:
+    if ready:
+        message = (
+            "## Cognee Memory Connected\n"
+            f"Mode: {mode} | Dataset: {dataset} | Session: {session_id}\n\n"
+            "Cognee organizes knowledge into three categories.\n"
+            "- user_context: user preferences and personal facts\n"
+            "- project_docs: repository and project knowledge\n"
+            "- agent_actions: tool traces and agent findings\n\n"
+            "Use /cognee-memory:cognee-remember to store permanent memory, "
+            "and /cognee-memory:cognee-search to query by node set."
+        )
+    else:
+        message = (
+            "## Cognee Memory Connecting\n"
+            f"Mode: {mode} | Dataset: {dataset} | Session: {session_id}\n\n"
+            "The local Cognee server is starting up (first run or database "
+            "migrations can take a little while). Your prompts work normally now; "
+            "memory recall activates automatically once the server is ready."
+        )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "systemMessage": message,
+        }
+    }
+
+
 async def _start(payload: dict | None = None) -> dict:
     config = load_config()
     payload = payload or {}
@@ -730,17 +1091,14 @@ async def _start(payload: dict | None = None) -> dict:
             {"mode": "managed_endpoint", "service_url": explicit_service_url},
         )
     else:
+        # Local agent mode. The service URL is known up front; whether the
+        # server is already serving is decided below (inline vs deferred boot).
         os.environ["COGNEE_AGENT_MODE"] = "true"
-        try:
-            _ensure_local_server_running(config)
-        except Exception as exc:
-            hook_log("server_bootstrap_warning", {"error": str(exc)[:200]})
+        config["service_url"] = _LOCAL_SERVICE_URL
+        os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
         hook_log(
             "endpoint_mode_selected",
-            {
-                "mode": "integration_local",
-                "service_url": str(config.get("service_url", "") or ""),
-            },
+            {"mode": "integration_local", "service_url": _LOCAL_SERVICE_URL},
         )
 
     session_id = get_session_id(config, cwd)
@@ -775,67 +1133,37 @@ async def _start(payload: dict | None = None) -> dict:
     os.environ["COGNEE_SESSION_KEY"] = session_key
     dataset = get_dataset(config)
 
-    # Configure cognee (cloud or local)
-    try:
-        await ensure_cognee_ready(config)
-    except Exception as e:
-        print(f"cognee-plugin: init warning ({e})", file=sys.stderr)
-
-    # Register agent identity.
+    # Heavy work = agent registration + dataset creation (+ a server boot wait
+    # only when the server isn't up yet). Routing:
+    #   * managed endpoint or lazy disabled -> inline (legacy behavior)
+    #   * lazy + server already live         -> inline; registration is fast
+    #     against a healthy server, so recall works on the very first prompt
+    #   * lazy + server not yet live         -> defer to the detached bootstrapper
+    #     so SessionStart never blocks on a cold boot / migrations
     user_id = ""
     agent_api_key = ""
-    agent_id = ""
-    agent_name = _resolve_agent_name(config, cwd)
-    os.environ["COGNEE_AGENT_NAME"] = agent_name
-    registered = False
-
-    # Preferred HTTP path: create/get named agent, use its API key,
-    # and register this session in agent-mode.
-    if is_cloud_mode(config):
-        try:
-            (
-                agent_id,
-                agent_api_key,
-                agent_name,
-                registered,
-            ) = await _ensure_agent_credentials_and_register(
-                config, cwd, session_id, agent_session_name, session_key
-            )
-            if agent_id:
-                user_id = agent_id
-        except Exception as exc:
-            message = str(exc)[:300]
-            hook_log("agent_lifecycle_error", {"error": message})
-            print(f"cognee-plugin: agent lifecycle failed ({message})", file=sys.stderr)
-            return {}
+    server_live = (not managed_endpoint) and _health_ok()
+    if managed_endpoint or not _LAZY_BOOTSTRAP or server_live:
+        user_id, agent_api_key, ok = await _run_heavy(
+            config,
+            cwd,
+            session_id,
+            agent_session_name,
+            session_key,
+            dataset,
+            managed_endpoint=managed_endpoint,
+            boot_timeout=_HEALTH_TIMEOUT_SECONDS,
+        )
+        if not ok:
+            if _LAZY_BOOTSTRAP and not managed_endpoint:
+                # Registration against a live server failed; retry out of band
+                # rather than aborting the session.
+                _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
+            else:
+                return {}
     else:
-        # Local SDK fallback path.
-        try:
-            if not user_id:
-                user_id, fallback_key = await ensure_identity(config)
-                if fallback_key and not agent_api_key:
-                    agent_api_key = fallback_key
-        except Exception as e:
-            print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
-
-    try:
-        if user_id and is_cloud_mode(config):
-            await ensure_dataset_ready_via_api(
-                config.get("service_url", ""),
-                agent_api_key or config.get("api_key", ""),
-                dataset,
-            )
-        elif user_id:
-            from uuid import UUID
-
-            from cognee.modules.users.methods import get_user
-
-            user = await get_user(UUID(user_id))
-            await ensure_dataset_ready(dataset, user)
-    except Exception as e:
-        print(f"cognee-plugin: dataset warning ({e})", file=sys.stderr)
-    if user_id:
-        os.environ["COGNEE_USER_ID"] = user_id
+        _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
+        user_id = os.environ.get("COGNEE_USER_ID", "")
 
     # Remove legacy resolved cache files. Runtime state now comes from HTTP endpoints.
     _purge_legacy_resolved_files()
@@ -874,25 +1202,26 @@ async def _start(payload: dict | None = None) -> dict:
         file=sys.stderr,
     )
 
-    guidance = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "systemMessage": (
-                "## Cognee Memory Connected\n"
-                f"Mode: {mode} | Dataset: {dataset} | Session: {session_id}\n\n"
-                "Cognee organizes knowledge into three categories.\n"
-                "- user_context: user preferences and personal facts\n"
-                "- project_docs: repository and project knowledge\n"
-                "- agent_actions: tool traces and agent findings\n\n"
-                "Use /cognee-memory:cognee-remember to store permanent memory, "
-                "and /cognee-memory:cognee-search to query by node set."
-            ),
-        }
-    }
-    return guidance
+    ready = managed_endpoint or server_ready_hint(str(config.get("service_url", "") or ""))
+    return _session_start_guidance(mode, dataset, session_id, ready)
 
 
 def main():
+    # Detached bootstrap mode: run the slow server boot + registration out of
+    # band so the SessionStart hook itself returns fast.
+    if _BOOTSTRAP_ARG in sys.argv:
+        idx = sys.argv.index(_BOOTSTRAP_ARG)
+        raw = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ""
+        try:
+            bootstrap = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            bootstrap = {}
+        try:
+            asyncio.run(_run_bootstrap(bootstrap))
+        except Exception as exc:
+            hook_log("bootstrap_main_exception", {"error": str(exc)[:200]})
+        return
+
     payload_raw = sys.stdin.read()
     try:
         payload = json.loads(payload_raw) if payload_raw.strip() else {}
