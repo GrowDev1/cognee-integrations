@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -27,6 +28,14 @@ from pathlib import Path
 # Add scripts dir to path for config import
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
+    _COGNEE_CACHE_DIR,
+    _COGNEE_DATA_DIR,
+    _COGNEE_SYSTEM_DIR,
+    _VENV_DIR,
+    _VENV_PYTHON,
+    _VENV_READY_MARKER,
+    _reexec_into_venv,
+    apply_cognee_env,
     hook_log,
     mark_server_ready,
     quiet_hook_output,
@@ -85,6 +94,235 @@ _LAZY_BOOTSTRAP = os.environ.get("COGNEE_LAZY_BOOTSTRAP", "1").strip().lower() n
     "no",
 )
 
+# --- Self-managed cognee install ---------------------------------------------
+# uv is kept self-contained under ~/.cognee-plugin so we never touch the user's
+# Python or PATH. A uv-managed Python guarantees a cognee-compatible runtime
+# (cognee requires 3.10-3.14) regardless of what's installed on the machine.
+_UV_DIR = _GLOBAL_STATE_DIR / "uv"
+_UV_BIN = _UV_DIR / ("uv.exe" if os.name == "nt" else "uv")
+_UV_PYTHON_DIR = _GLOBAL_STATE_DIR / "python"
+_UV_INSTALL_URL = "https://astral.sh/uv/install.sh"
+_PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or "3.12"
+_INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
+
+# Install single-flight. Distinct from the server boot lock (which is short, on
+# the assumption a boot completes in ~a minute): a cold cognee install can take
+# minutes, so concurrent sessions must NOT install into the same venv at once.
+_VENV_INSTALL_LOCK = _GLOBAL_STATE_DIR / "venv-install.lock"
+_VENV_INSTALL_LOCK_STALE_SECONDS = _INSTALL_TIMEOUT_SECONDS + 60.0
+_VENV_INSTALL_WAIT_SECONDS = _INSTALL_TIMEOUT_SECONDS + 60.0
+_VENV_INSTALL_POLL_SECONDS = 0.5
+
+
+def _find_uv() -> str:
+    """Locate uv: prefer our self-managed copy, then anything on PATH."""
+    if _UV_BIN.exists():
+        return str(_UV_BIN)
+    found = shutil.which("uv")
+    return found or ""
+
+
+def _install_uv() -> str:
+    """Install the standalone uv binary into ~/.cognee-plugin/uv (no PATH edits)."""
+    try:
+        _UV_DIR.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        # UV_UNMANAGED_INSTALL drops the binary in the given dir without editing
+        # shell profiles or managing updates — exactly what we want.
+        env["UV_UNMANAGED_INSTALL"] = str(_UV_DIR)
+        subprocess.run(
+            ["sh", "-c", f"curl -LsSf {_UV_INSTALL_URL} | sh"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if _UV_BIN.exists():
+            return str(_UV_BIN)
+    except Exception as exc:
+        hook_log("uv_install_failed", {"error": str(exc)[:300]})
+    return ""
+
+
+def _venv_cognee_version() -> str:
+    """Installed cognee version inside the plugin venv, or '' if unimportable."""
+    if not _VENV_PYTHON.exists():
+        return ""
+    try:
+        out = subprocess.run(
+            [
+                str(_VENV_PYTHON),
+                "-c",
+                "import importlib.metadata as m; print(m.version('cognee'))",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception as exc:
+        hook_log("cognee_version_probe_failed", {"error": str(exc)[:200]})
+    return ""
+
+
+def _write_venv_ready(version: str) -> None:
+    try:
+        payload = {
+            "cognee_version": version,
+            "python": str(_VENV_PYTHON),
+            "updated_at": time.time(),
+        }
+        tmp = _VENV_READY_MARKER.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, _VENV_READY_MARKER)
+    except Exception as exc:
+        hook_log("venv_ready_write_failed", {"error": str(exc)[:200]})
+
+
+def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
+    """Ensure the plugin venv exists and holds the latest cognee.
+
+    Called from the server-boot critical section (so it is already
+    single-flighted) and only at boot points — i.e. when no healthy server is
+    serving. Always tries to upgrade to the latest cognee BEFORE the server
+    boots, so the server's FastAPI lifespan migrations run on the new code.
+
+    Fails soft: if the upgrade can't run (e.g. offline) but a usable cognee is
+    already installed, returns True with whatever version is present. Returns
+    False only when no importable cognee venv exists afterwards.
+    """
+    apply_cognee_env()
+    for directory in (_COGNEE_SYSTEM_DIR, _COGNEE_DATA_DIR, _COGNEE_CACHE_DIR):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            hook_log("cognee_data_dir_mkdir_failed", {"dir": str(directory), "error": str(exc)[:200]})
+
+    owner = f"install:{os.getpid()}"
+    acquired = False
+    deadline = time.monotonic() + _VENV_INSTALL_WAIT_SECONDS
+    try:
+        _VENV_INSTALL_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            now = time.time()
+            if _VENV_INSTALL_LOCK.exists():
+                stale = False
+                try:
+                    raw = json.loads(_VENV_INSTALL_LOCK.read_text(encoding="utf-8"))
+                    pid = int(raw.get("pid", 0) or 0)
+                    created_at = float(raw.get("created_at", 0) or 0)
+                    stale = (not _pid_alive(pid)) or (
+                        now - created_at > _VENV_INSTALL_LOCK_STALE_SECONDS
+                    )
+                except Exception:
+                    stale = True
+                if stale:
+                    try:
+                        _VENV_INSTALL_LOCK.unlink()
+                    except Exception as exc:
+                        hook_log("venv_install_lock_unlink_failed", {"error": str(exc)[:200]})
+
+            try:
+                fd = os.open(str(_VENV_INSTALL_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
+                acquired = True
+                break
+            except FileExistsError:
+                # Another process owns the install. Don't install concurrently —
+                # wait for it to produce a usable venv, then reuse it.
+                if _venv_cognee_version():
+                    return True
+                if time.monotonic() >= deadline:
+                    return bool(_venv_cognee_version())
+                time.sleep(_VENV_INSTALL_POLL_SECONDS)
+
+        uv = _find_uv() or _install_uv()
+        venv_present = _VENV_PYTHON.exists()
+
+        if uv:
+            env = os.environ.copy()
+            env.setdefault("UV_PYTHON_INSTALL_DIR", str(_UV_PYTHON_DIR))
+            try:
+                if not venv_present:
+                    subprocess.run(
+                        [uv, "venv", str(_VENV_DIR), "--python", _PINNED_PYTHON],
+                        env=env,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                subprocess.run(
+                    [uv, "pip", "install", "--upgrade", "--python", str(_VENV_PYTHON), "cognee"],
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                hook_log("cognee_install_failed", {"via": "uv", "error": str(exc)[:300]})
+        elif not venv_present:
+            # Last-resort fallback: stdlib venv + pip. Slower, and relies on the
+            # system python3 being a cognee-compatible version (3.10-3.14).
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(_VENV_DIR)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                subprocess.run(
+                    [str(_VENV_PYTHON), "-m", "pip", "install", "--upgrade", "cognee"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                hook_log("cognee_install_failed", {"via": "venv_pip", "error": str(exc)[:300]})
+
+        version = _venv_cognee_version()
+        if not version:
+            hook_log("cognee_venv_unusable", {"venv_python": str(_VENV_PYTHON)})
+            return False
+        _write_venv_ready(version)
+        hook_log("cognee_install_ready", {"version": version})
+        return True
+    finally:
+        if acquired:
+            try:
+                _VENV_INSTALL_LOCK.unlink()
+            except Exception as exc:
+                hook_log("venv_install_lock_release_failed", {"error": str(exc)[:200]})
+
+
+def _parse_host_port(url: str) -> tuple[str, int]:
+    parsed = urllib.parse.urlparse(url if "://" in url else f"http://{url}")
+    return (parsed.hostname or "localhost"), (parsed.port or 8011)
+
+
+def _is_local_url(url: str) -> bool:
+    """True if the URL points at this machine (so we may boot a server on it)."""
+    host, _ = _parse_host_port(url)
+    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def _with_scheme(url: str) -> str:
+    """Ensure the URL has a scheme so urllib + downstream HTTP helpers accept it."""
+    url = str(url or "").strip()
+    if url and "://" not in url:
+        url = f"http://{url}"
+    return url.rstrip("/")
+
+
+def _health_url(service_url: str) -> str:
+    return f"{_with_scheme(service_url or _LOCAL_SERVICE_URL)}/health"
+
 
 def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
     try:
@@ -94,7 +332,7 @@ def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
         return False
 
 
-def _wait_for_health(deadline_seconds: float) -> bool:
+def _wait_for_health(deadline_seconds: float, health_url: str = _HEALTH_URL) -> bool:
     """Poll /health until the server is serving or the deadline elapses.
 
     Used by bootstrap workers that did not win the boot single-flight: they
@@ -103,7 +341,7 @@ def _wait_for_health(deadline_seconds: float) -> bool:
     """
     deadline = time.monotonic() + deadline_seconds
     while True:
-        if _health_ok():
+        if _health_ok(health_url):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -113,10 +351,26 @@ def _wait_for_health(deadline_seconds: float) -> bool:
 def _ensure_local_server_running(
     config: dict, health_timeout: float = _HEALTH_TIMEOUT_SECONDS
 ) -> None:
-    if _health_ok():
-        config["service_url"] = _LOCAL_SERVICE_URL
-        os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+    # Target the configured local URL (any port) or the default; boot uvicorn on
+    # that URL's port if it's not already serving.
+    service_url = _with_scheme(config.get("service_url", "") or _LOCAL_SERVICE_URL)
+    health_url = _health_url(service_url)
+    _, port = _parse_host_port(service_url)
+
+    def _ready() -> None:
+        config["service_url"] = service_url
+        os.environ["COGNEE_SERVICE_URL"] = service_url
+
+    if _health_ok(health_url):
+        _ready()
         return
+
+    # No server is serving and we're at a boot point: ensure the venv holds the
+    # latest cognee BEFORE booting, so the server's lifespan migrations run on
+    # the upgraded code. Single-flighted on its own (long) lock, separate from
+    # the short boot lock below, since a cold install can take minutes.
+    if not ensure_cognee_installed():
+        raise RuntimeError("cognee runtime unavailable (install/upgrade failed)")
 
     owner = f"session-start:{os.getpid()}"
     acquired = False
@@ -151,36 +405,38 @@ def _ensure_local_server_running(
                 hook_log("server_bootstrap_lock_acquired", {"owner": owner})
                 break
             except FileExistsError:
-                if _health_ok():
-                    config["service_url"] = _LOCAL_SERVICE_URL
-                    os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+                if _health_ok(health_url):
+                    _ready()
                     return
                 if time.monotonic() >= deadline:
                     raise RuntimeError("server bootstrap lock timeout")
                 time.sleep(_SERVER_BOOT_LOCK_POLL_SECONDS)
 
-        if _health_ok():
-            config["service_url"] = _LOCAL_SERVICE_URL
-            os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+        if _health_ok(health_url):
+            _ready()
             return
 
         server_env = os.environ.copy()
+        # Data-dir pins + CACHING are already in os.environ via apply_cognee_env(),
+        # so the copy carries them to the server process.
+        # Run in agent mode: the server tears itself down once all registered
+        # agents disconnect.
+        server_env["COGNEE_AGENT_MODE"] = "true"
         subprocess.Popen(
-            ["uvicorn", "cognee.api.client:app", "--port", "8011"],
+            [str(_VENV_PYTHON), "-m", "uvicorn", "cognee.api.client:app", "--port", str(port)],
             env=server_env,
             start_new_session=True,
         )
 
         health_deadline = time.monotonic() + health_timeout
         while time.monotonic() < health_deadline:
-            if _health_ok():
-                config["service_url"] = _LOCAL_SERVICE_URL
-                os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+            if _health_ok(health_url):
+                _ready()
                 return
             time.sleep(_HEALTH_POLL_SECONDS)
 
         raise RuntimeError(
-            f"Cognee server did not become healthy at {_HEALTH_URL} within {health_timeout}s"
+            f"Cognee server did not become healthy at {health_url} within {health_timeout}s"
         )
     finally:
         if acquired:
@@ -951,6 +1207,14 @@ async def _run_heavy(
         except Exception as exc:
             hook_log("server_bootstrap_warning", {"error": str(exc)[:200]})
 
+    # On a cold start this worker began under the host python3, so the
+    # _plugin_common import-time guard could not re-exec us. The boot above
+    # (via ensure_cognee_installed) has now built the venv, so flip into it
+    # before any cognee/aiohttp import below resolves against the host. No-op
+    # when the venv is absent (connect/managed mode never builds one) or when
+    # we are already inside it (warm start).
+    _reexec_into_venv()
+
     # Configure cognee (cloud or local)
     try:
         await ensure_cognee_ready(config)
@@ -1017,7 +1281,7 @@ async def _run_heavy(
     service_url = _normalize_service_url(str(config.get("service_url", "") or ""))
     if not service_url and not managed_endpoint:
         service_url = _LOCAL_SERVICE_URL
-    if service_url and (managed_endpoint or server_health_ok(service_url, timeout=1.5)):
+    if service_url and server_health_ok(service_url, timeout=1.5):
         mark_server_ready(service_url)
 
     return user_id, agent_api_key, True
@@ -1042,13 +1306,14 @@ async def _run_bootstrap(bootstrap: dict) -> None:
     agent_session_name = str(bootstrap.get("agent_session_name", "") or session_key)
     if session_key:
         os.environ["COGNEE_SESSION_KEY"] = session_key
-    os.environ["COGNEE_AGENT_MODE"] = "true"
-    config["service_url"] = _LOCAL_SERVICE_URL
-    os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+    service_url = _with_scheme(bootstrap.get("service_url", "") or _LOCAL_SERVICE_URL)
+    health_url = _health_url(service_url)
+    config["service_url"] = service_url
+    os.environ["COGNEE_SERVICE_URL"] = service_url
 
     # 1. Ensure the server is up. Only the single-flight winner spawns uvicorn;
     #    everyone else waits for /health (the winner may still be migrating).
-    if not _health_ok():
+    if not _health_ok(health_url):
         with _bootstrap_singleflight() as acquired:
             if acquired:
                 try:
@@ -1059,7 +1324,7 @@ async def _run_bootstrap(bootstrap: dict) -> None:
                     hook_log("server_bootstrap_warning", {"error": str(exc)[:200]})
             else:
                 hook_log("bootstrap_waiting_for_peer", {"session_id": session_id})
-        if not _wait_for_health(_SERVER_BOOT_DEADLINE_SECONDS):
+        if not _wait_for_health(_SERVER_BOOT_DEADLINE_SECONDS, health_url):
             hook_log("bootstrap_server_unhealthy", {"session_id": session_id})
             return
 
@@ -1114,28 +1379,18 @@ async def _start(payload: dict | None = None) -> dict:
     config = load_config()
     payload = payload or {}
     cwd = str(payload.get("cwd") or os.environ.get("CLAUDE_CWD") or os.getcwd())
-    explicit_service_url = str(config.get("service_url", "") or "").strip()
-    explicit_api_key = str(config.get("api_key", "") or "").strip()
-    managed_endpoint = bool(explicit_service_url and explicit_api_key)
-
-    if managed_endpoint:
-        os.environ["COGNEE_AGENT_MODE"] = "false"
-        os.environ["COGNEE_SERVICE_URL"] = explicit_service_url
-        os.environ["COGNEE_API_KEY"] = explicit_api_key
-        hook_log(
-            "endpoint_mode_selected",
-            {"mode": "managed_endpoint", "service_url": explicit_service_url},
-        )
-    else:
-        # Local agent mode. The service URL is known up front; whether the
-        # server is already serving is decided below (inline vs deferred boot).
-        os.environ["COGNEE_AGENT_MODE"] = "true"
-        config["service_url"] = _LOCAL_SERVICE_URL
-        os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
-        hook_log(
-            "endpoint_mode_selected",
-            {"mode": "integration_local", "service_url": _LOCAL_SERVICE_URL},
-        )
+    # The service URL is the sole router (api_key is optional auth, with a
+    # default-user fallback in registration). COGNEE_AGENT_MODE is NOT decided
+    # here: it's set only when we actually boot a server (in
+    # _ensure_local_server_running), so connecting to an already-running server
+    # never claims ownership of its teardown.
+    configured_url = _with_scheme(str(config.get("service_url", "") or "").strip())
+    api_key = str(config.get("api_key", "") or "").strip()
+    target_url = configured_url or _LOCAL_SERVICE_URL
+    config["service_url"] = target_url
+    os.environ["COGNEE_SERVICE_URL"] = target_url
+    if api_key:
+        os.environ["COGNEE_API_KEY"] = api_key
 
     session_id = get_session_id(config, cwd)
     payload_session_id = (
@@ -1169,17 +1424,23 @@ async def _start(payload: dict | None = None) -> dict:
     os.environ["COGNEE_SESSION_KEY"] = session_key
     dataset = get_dataset(config)
 
-    # Heavy work = agent registration + dataset creation (+ a server boot wait
-    # only when the server isn't up yet). Routing:
-    #   * managed endpoint or lazy disabled -> inline (legacy behavior)
-    #   * lazy + server already live         -> inline; registration is fast
-    #     against a healthy server, so recall works on the very first prompt
-    #   * lazy + server not yet live         -> defer to the detached bootstrapper
-    #     so SessionStart never blocks on a cold boot / migrations
+    # Boot-vs-connect is decided purely by whether the server is already up:
+    #   * up                -> connect (we don't boot, so agent mode is left as-is)
+    #   * down + local URL  -> boot it; agent mode is set at the uvicorn spawn so
+    #                          the server tears down once all agents disconnect
+    #   * down + remote URL -> can't boot a remote host; connect and degrade
     user_id = ""
     agent_api_key = ""
-    server_live = (not managed_endpoint) and _health_ok()
-    if managed_endpoint or not _LAZY_BOOTSTRAP or server_live:
+    server_live = _health_ok(_health_url(target_url))
+    will_boot = (not server_live) and _is_local_url(target_url)
+    hook_log(
+        "endpoint_mode_selected",
+        {"service_url": target_url, "server_live": server_live, "will_boot": will_boot},
+    )
+    if will_boot and _LAZY_BOOTSTRAP:
+        _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
+        user_id = os.environ.get("COGNEE_USER_ID", "")
+    else:
         user_id, agent_api_key, ok = await _run_heavy(
             config,
             cwd,
@@ -1187,19 +1448,15 @@ async def _start(payload: dict | None = None) -> dict:
             agent_session_name,
             session_key,
             dataset,
-            managed_endpoint=managed_endpoint,
+            managed_endpoint=not will_boot,
             boot_timeout=_HEALTH_TIMEOUT_SECONDS,
         )
         if not ok:
-            if _LAZY_BOOTSTRAP and not managed_endpoint:
-                # Registration against a live server failed; retry out of band
-                # rather than aborting the session.
+            if _LAZY_BOOTSTRAP and _is_local_url(target_url):
+                # Inline attempt failed; retry the heavy path out of band.
                 _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
             else:
                 return {}
-    else:
-        _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
-        user_id = os.environ.get("COGNEE_USER_ID", "")
 
     # Remove legacy resolved cache files. Runtime state now comes from HTTP endpoints.
     _purge_legacy_resolved_files()
@@ -1238,7 +1495,7 @@ async def _start(payload: dict | None = None) -> dict:
         file=sys.stderr,
     )
 
-    ready = managed_endpoint or server_ready_hint(str(config.get("service_url", "") or ""))
+    ready = server_live or server_ready_hint(str(config.get("service_url", "") or ""))
     return _session_start_guidance(mode, dataset, session_id, ready)
 
 

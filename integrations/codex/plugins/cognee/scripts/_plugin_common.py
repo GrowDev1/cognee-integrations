@@ -721,7 +721,9 @@ def server_ready_hint(service_url: str = "") -> bool:
 def resolve_runtime_mode() -> dict:
     """Resolve hook runtime mode from effective endpoint auth."""
     service_url, api_key = resolved_http_endpoint_auth()
-    mode = "http" if (service_url and api_key) else "local_sdk"
+    # A configured service URL alone selects HTTP mode; an API key is no longer
+    # required to decide whether to talk to a server (it's still sent when present).
+    mode = "http" if service_url else "local_sdk"
     return {
         "mode": mode,
         "service_url": service_url,

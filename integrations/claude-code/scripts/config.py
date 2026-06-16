@@ -113,12 +113,11 @@ def load_config() -> dict:
         config["api_key"] = ""
         config["base_url"] = ""
     elif backend not in ("http", "api", "cloud", "server"):
-        # Auto mode enters managed-endpoint mode only when both values are present.
-        # Partial endpoint config is ignored to avoid ambiguous routing.
-        has_service_url = bool(str(config.get("service_url") or "").strip())
-        has_api_key = bool(str(config.get("api_key") or "").strip())
-        if has_service_url != has_api_key:
-            config["service_url"] = ""
+        # The service URL is the sole router: a URL alone is a complete
+        # instruction (connect to it, or boot it if local; auth falls back to
+        # the default user when no key is given). A key with no URL has nothing
+        # to point at, so drop it and fall back to the local default.
+        if not str(config.get("service_url") or "").strip():
             config["api_key"] = ""
             config["base_url"] = ""
 

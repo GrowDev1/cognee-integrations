@@ -46,6 +46,43 @@ AUTO_IMPROVE_EVERY_DEFAULT = 30
 SYNC_LOCK_STALE_SECONDS = 15 * 60
 _DEFAULT_LOCAL_SERVICE_URL = "http://localhost:8011"
 
+# --- Self-managed cognee runtime ---------------------------------------------
+# The plugin owns an isolated virtualenv for cognee under ~/.cognee-plugin/venv
+# (disposable: rebuilt/upgraded freely), while all persistent data lives under
+# ~/.cognee (the "safe space" that survives venv rebuilds and cognee upgrades).
+_VENV_DIR = _PLUGIN_DIR / "venv"
+_VENV_PYTHON = _VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+_VENV_READY_MARKER = _PLUGIN_DIR / "venv-ready.json"
+
+# cognee's own default puts its databases INSIDE the install dir (the venv), so
+# they would be wiped on every venv rebuild/upgrade. Pin them to ~/.cognee.
+_COGNEE_HOME = Path.home() / ".cognee"
+_COGNEE_SYSTEM_DIR = _COGNEE_HOME / "system"
+_COGNEE_DATA_DIR = _COGNEE_HOME / "data"
+_COGNEE_CACHE_DIR = _COGNEE_HOME / "cache"
+
+
+def venv_python() -> Path:
+    """Path to the plugin-owned venv interpreter (may not exist yet)."""
+    return _VENV_PYTHON
+
+
+def apply_cognee_env() -> None:
+    """Pin cognee's data dirs + caching into the environment.
+
+    Uses setdefault so an explicit user/env override always wins. Called on
+    import so any process that spawns the cognee server (via os.environ.copy())
+    inherits a stable, upgrade-safe data location. CACHING is already cognee's
+    default but is set explicitly so a future default change can't disable it.
+    """
+    os.environ.setdefault("SYSTEM_ROOT_DIRECTORY", str(_COGNEE_SYSTEM_DIR))
+    os.environ.setdefault("DATA_ROOT_DIRECTORY", str(_COGNEE_DATA_DIR))
+    os.environ.setdefault("CACHE_ROOT_DIRECTORY", str(_COGNEE_CACHE_DIR))
+    os.environ.setdefault("CACHING", "true")
+
+
+apply_cognee_env()
+
 
 def _sanitize_session_key(value: str) -> str:
     safe = []
@@ -326,6 +363,42 @@ def hook_log(event: str, detail: Optional[dict] = None) -> None:
             fh.write(serialized + "\n")
     except Exception:
         pass
+
+
+def _reexec_into_venv() -> None:
+    """Re-exec the current hook under the plugin-owned venv interpreter.
+
+    Hooks are launched by the host as ``python3 <script>`` using whatever
+    python3 is on PATH — which has neither cognee nor aiohttp. The runtime
+    lives in ``~/.cognee-plugin/venv``. Once that venv exists, re-exec into it
+    so every import resolves there. No-op before the venv exists (cold start,
+    pre-install) or when already running inside it.
+    """
+    if os.environ.get("COGNEE_PLUGIN_IN_VENV") == "1":
+        return  # loop guard: this process already re-execed (or opted out)
+    if not sys.argv or not os.path.isfile(sys.argv[0]):
+        return  # not a `python script.py` launch (e.g. -c/-m/stdin) — don't rebuild argv
+    vpy = _VENV_PYTHON
+    if not vpy.exists():
+        return  # cold start — install hasn't built the venv yet
+    os.environ["COGNEE_PLUGIN_IN_VENV"] = "1"
+    try:
+        if os.path.samefile(str(vpy), sys.executable):
+            return  # the host python3 already *is* the venv interpreter
+    except OSError:
+        pass
+    try:
+        # execv inherits os.environ (incl. the loop guard just set above).
+        os.execv(str(vpy), [str(vpy), *sys.argv])
+    except OSError as exc:
+        # Better to run degraded under the host interpreter than to die.
+        hook_log("venv_reexec_failed", {"error": str(exc)[:200]})
+
+
+# Fired on import: every cognee-touching hook imports this module before any
+# aiohttp/cognee import, so this is the single chokepoint that pins all hooks
+# to the venv runtime once it exists.
+_reexec_into_venv()
 
 
 def _verbose_enabled() -> bool:
@@ -734,7 +807,9 @@ def resolve_runtime_mode() -> dict:
     service_url_raw, url_source = _local_api_url_with_source()
     service_url = _normalize_service_url(service_url_raw)
     api_key, key_source = _api_key_with_source(service_url)
-    mode = "http" if (service_url and api_key) else "local_sdk"
+    # A configured service URL alone selects HTTP mode; an API key is no longer
+    # required to decide whether to talk to a server (it's still sent when present).
+    mode = "http" if service_url else "local_sdk"
     if service_url:
         os.environ["COGNEE_SERVICE_URL"] = service_url
     if api_key:

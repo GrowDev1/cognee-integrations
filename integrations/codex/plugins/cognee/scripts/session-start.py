@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -85,6 +86,29 @@ _LAZY_BOOTSTRAP = os.environ.get("COGNEE_LAZY_BOOTSTRAP", "1").strip().lower() n
 )
 
 
+def _parse_host_port(url: str) -> tuple[str, int]:
+    parsed = urllib.parse.urlparse(url if "://" in url else f"http://{url}")
+    return (parsed.hostname or "localhost"), (parsed.port or 8011)
+
+
+def _is_local_url(url: str) -> bool:
+    """True if the URL points at this machine (so we may boot a server on it)."""
+    host, _ = _parse_host_port(url)
+    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def _with_scheme(url: str) -> str:
+    """Ensure the URL has a scheme so urllib + downstream HTTP helpers accept it."""
+    url = str(url or "").strip()
+    if url and "://" not in url:
+        url = f"http://{url}"
+    return url.rstrip("/")
+
+
+def _health_url(service_url: str) -> str:
+    return f"{_with_scheme(service_url or _LOCAL_SERVICE_URL)}/health"
+
+
 def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -93,7 +117,7 @@ def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
         return False
 
 
-def _wait_for_health(deadline_seconds: float) -> bool:
+def _wait_for_health(deadline_seconds: float, health_url: str = _HEALTH_URL) -> bool:
     """Poll /health until the server is serving or the deadline elapses.
 
     Used by bootstrap workers that did not win the boot single-flight: they
@@ -102,7 +126,7 @@ def _wait_for_health(deadline_seconds: float) -> bool:
     """
     deadline = time.monotonic() + deadline_seconds
     while True:
-        if _health_ok():
+        if _health_ok(health_url):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -112,9 +136,18 @@ def _wait_for_health(deadline_seconds: float) -> bool:
 def _ensure_local_server_running(
     config: dict, health_timeout: float = _HEALTH_TIMEOUT_SECONDS
 ) -> None:
-    if _health_ok():
-        config["service_url"] = _LOCAL_SERVICE_URL
-        os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+    # Target the configured local URL (any port) or the default; boot uvicorn on
+    # that URL's port if it's not already serving.
+    service_url = _with_scheme(config.get("service_url", "") or _LOCAL_SERVICE_URL)
+    health_url = _health_url(service_url)
+    _, port = _parse_host_port(service_url)
+
+    def _ready() -> None:
+        config["service_url"] = service_url
+        os.environ["COGNEE_SERVICE_URL"] = service_url
+
+    if _health_ok(health_url):
+        _ready()
         return
 
     owner = f"session-start:{os.getpid()}"
@@ -150,36 +183,36 @@ def _ensure_local_server_running(
                 hook_log("server_bootstrap_lock_acquired", {"owner": owner})
                 break
             except FileExistsError:
-                if _health_ok():
-                    config["service_url"] = _LOCAL_SERVICE_URL
-                    os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+                if _health_ok(health_url):
+                    _ready()
                     return
                 if time.monotonic() >= deadline:
                     raise RuntimeError("server bootstrap lock timeout")
                 time.sleep(_SERVER_BOOT_LOCK_POLL_SECONDS)
 
-        if _health_ok():
-            config["service_url"] = _LOCAL_SERVICE_URL
-            os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+        if _health_ok(health_url):
+            _ready()
             return
 
         server_env = os.environ.copy()
+        # We are spawning the server, so run it in agent mode: it tears itself
+        # down once all registered agents disconnect.
+        server_env["COGNEE_AGENT_MODE"] = "true"
         subprocess.Popen(
-            ["uvicorn", "cognee.api.client:app", "--port", "8011"],
+            ["uvicorn", "cognee.api.client:app", "--port", str(port)],
             env=server_env,
             start_new_session=True,
         )
 
         health_deadline = time.monotonic() + health_timeout
         while time.monotonic() < health_deadline:
-            if _health_ok():
-                config["service_url"] = _LOCAL_SERVICE_URL
-                os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+            if _health_ok(health_url):
+                _ready()
                 return
             time.sleep(_HEALTH_POLL_SECONDS)
 
         raise RuntimeError(
-            f"Cognee server did not become healthy at {_HEALTH_URL} within {health_timeout}s"
+            f"Cognee server did not become healthy at {health_url} within {health_timeout}s"
         )
     finally:
         if acquired:
@@ -1016,7 +1049,7 @@ async def _run_heavy(
     service_url = _normalize_service_url(str(config.get("service_url", "") or ""))
     if not service_url and not managed_endpoint:
         service_url = _LOCAL_SERVICE_URL
-    if service_url and (managed_endpoint or server_health_ok(service_url, timeout=1.5)):
+    if service_url and server_health_ok(service_url, timeout=1.5):
         mark_server_ready(service_url)
 
     return user_id, agent_api_key, True
@@ -1041,13 +1074,14 @@ async def _run_bootstrap(bootstrap: dict) -> None:
     agent_session_name = str(bootstrap.get("agent_session_name", "") or session_key)
     if session_key:
         os.environ["COGNEE_SESSION_KEY"] = session_key
-    os.environ["COGNEE_AGENT_MODE"] = "true"
-    config["service_url"] = _LOCAL_SERVICE_URL
-    os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
+    service_url = _with_scheme(bootstrap.get("service_url", "") or _LOCAL_SERVICE_URL)
+    health_url = _health_url(service_url)
+    config["service_url"] = service_url
+    os.environ["COGNEE_SERVICE_URL"] = service_url
 
     # 1. Ensure the server is up. Only the single-flight winner spawns uvicorn;
     #    everyone else waits for /health (the winner may still be migrating).
-    if not _health_ok():
+    if not _health_ok(health_url):
         with _bootstrap_singleflight() as acquired:
             if acquired:
                 try:
@@ -1058,7 +1092,7 @@ async def _run_bootstrap(bootstrap: dict) -> None:
                     hook_log("server_bootstrap_warning", {"error": str(exc)[:200]})
             else:
                 hook_log("bootstrap_waiting_for_peer", {"session_id": session_id})
-        if not _wait_for_health(_SERVER_BOOT_DEADLINE_SECONDS):
+        if not _wait_for_health(_SERVER_BOOT_DEADLINE_SECONDS, health_url):
             hook_log("bootstrap_server_unhealthy", {"session_id": session_id})
             return
 
@@ -1085,28 +1119,18 @@ async def _start(payload: dict | None = None) -> dict:
     config = load_config()
     payload = payload or {}
     cwd = str(payload.get("cwd") or os.environ.get("CODEX_CWD") or os.getcwd())
-    explicit_service_url = str(config.get("service_url", "") or "").strip()
-    explicit_api_key = str(config.get("api_key", "") or "").strip()
-    managed_endpoint = bool(explicit_service_url and explicit_api_key)
-
-    if managed_endpoint:
-        os.environ["COGNEE_AGENT_MODE"] = "false"
-        os.environ["COGNEE_SERVICE_URL"] = explicit_service_url
-        os.environ["COGNEE_API_KEY"] = explicit_api_key
-        hook_log(
-            "endpoint_mode_selected",
-            {"mode": "managed_endpoint", "service_url": explicit_service_url},
-        )
-    else:
-        # Local agent mode. The service URL is known up front; whether the
-        # server is already serving is decided below (inline vs deferred boot).
-        os.environ["COGNEE_AGENT_MODE"] = "true"
-        config["service_url"] = _LOCAL_SERVICE_URL
-        os.environ["COGNEE_SERVICE_URL"] = _LOCAL_SERVICE_URL
-        hook_log(
-            "endpoint_mode_selected",
-            {"mode": "integration_local", "service_url": _LOCAL_SERVICE_URL},
-        )
+    # The service URL is the sole router (api_key is optional auth, with a
+    # default-user fallback in registration). COGNEE_AGENT_MODE is NOT decided
+    # here: it's set only when we actually boot a server (in
+    # _ensure_local_server_running), so connecting to an already-running server
+    # never claims ownership of its teardown.
+    configured_url = _with_scheme(str(config.get("service_url", "") or "").strip())
+    api_key = str(config.get("api_key", "") or "").strip()
+    target_url = configured_url or _LOCAL_SERVICE_URL
+    config["service_url"] = target_url
+    os.environ["COGNEE_SERVICE_URL"] = target_url
+    if api_key:
+        os.environ["COGNEE_API_KEY"] = api_key
 
     session_id = get_session_id(config, cwd)
     payload_session_id = (
@@ -1133,17 +1157,23 @@ async def _start(payload: dict | None = None) -> dict:
     os.environ["COGNEE_SESSION_KEY"] = session_key
     dataset = get_dataset(config)
 
-    # Heavy work = agent registration + dataset creation (+ a server boot wait
-    # only when the server isn't up yet). Routing:
-    #   * managed endpoint or lazy disabled -> inline (legacy behavior)
-    #   * lazy + server already live         -> inline; registration is fast
-    #     against a healthy server, so recall works on the very first prompt
-    #   * lazy + server not yet live         -> defer to the detached bootstrapper
-    #     so SessionStart never blocks on a cold boot / migrations
+    # Boot-vs-connect is decided purely by whether the server is already up:
+    #   * up                -> connect (we don't boot, so agent mode is left as-is)
+    #   * down + local URL  -> boot it; agent mode is set at the uvicorn spawn so
+    #                          the server tears down once all agents disconnect
+    #   * down + remote URL -> can't boot a remote host; connect and degrade
     user_id = ""
     agent_api_key = ""
-    server_live = (not managed_endpoint) and _health_ok()
-    if managed_endpoint or not _LAZY_BOOTSTRAP or server_live:
+    server_live = _health_ok(_health_url(target_url))
+    will_boot = (not server_live) and _is_local_url(target_url)
+    hook_log(
+        "endpoint_mode_selected",
+        {"service_url": target_url, "server_live": server_live, "will_boot": will_boot},
+    )
+    if will_boot and _LAZY_BOOTSTRAP:
+        _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
+        user_id = os.environ.get("COGNEE_USER_ID", "")
+    else:
         user_id, agent_api_key, ok = await _run_heavy(
             config,
             cwd,
@@ -1151,19 +1181,15 @@ async def _start(payload: dict | None = None) -> dict:
             agent_session_name,
             session_key,
             dataset,
-            managed_endpoint=managed_endpoint,
+            managed_endpoint=not will_boot,
             boot_timeout=_HEALTH_TIMEOUT_SECONDS,
         )
         if not ok:
-            if _LAZY_BOOTSTRAP and not managed_endpoint:
-                # Registration against a live server failed; retry out of band
-                # rather than aborting the session.
+            if _LAZY_BOOTSTRAP and _is_local_url(target_url):
+                # Inline attempt failed; retry the heavy path out of band.
                 _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
             else:
                 return {}
-    else:
-        _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
-        user_id = os.environ.get("COGNEE_USER_ID", "")
 
     # Remove legacy resolved cache files. Runtime state now comes from HTTP endpoints.
     _purge_legacy_resolved_files()
