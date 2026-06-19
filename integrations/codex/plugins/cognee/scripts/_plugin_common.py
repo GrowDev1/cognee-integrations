@@ -33,7 +33,23 @@ _SYNC_LOCK = _PLUGIN_DIR / "sync.lock"
 _BRIDGE_DIR = _PLUGIN_DIR / "bridge"
 _PENDING_DIR = _PLUGIN_DIR / "pending"
 _SUBPROCESS_LOG = _PLUGIN_DIR / "subprocess.log"
-_AGENT_KEYS_CACHE = _PLUGIN_DIR / "agent_keys.json"
+# Single-principal model: one API key (user-provided COGNEE_API_KEY or one minted
+# from the default user) is cached here. Replaces the old per-agent agent_keys.json.
+_API_KEY_CACHE = _PLUGIN_DIR / "api_key.json"
+# Host-session-id -> generated Cognee session-id map. The host (Claude/Codex)
+# session id is used ONLY as a local correlation key so every hook process of a
+# single launch resolves the SAME Cognee session id; it is never sent to Cognee
+# as an identity. A genuinely new launch gets a new host id -> new Cognee session;
+# a `resume` reuses the host id -> continues the same Cognee session.
+_SESSIONS_MAP_DIR = _PLUGIN_DIR / "sessions"
+# Cached count of the principal's Cognee sessions, for the status line's
+# "(+N more)" — refreshed by the prompt hook so the status line stays pure-local.
+_SESSIONS_COUNT_CACHE = _PLUGIN_DIR / "sessions_count.json"
+_SESSIONS_COUNT_TTL_SECONDS = 60
+# host_pid -> host_key bridge, written at SessionStart so a model-invoked command
+# (which has no session id in its env) can find its launch by walking the process
+# tree to the host pid, then look up the host_key here.
+_LAUNCHES_DIR = _PLUGIN_DIR / "launches"
 
 # Save-kinds tracked per turn. Keep this tuple in sync with bump_save_counter callers.
 SAVE_KINDS = ("prompt", "trace", "answer")
@@ -45,6 +61,45 @@ _LOG_LINE_CAP = 600
 AUTO_IMPROVE_EVERY_DEFAULT = 30
 SYNC_LOCK_STALE_SECONDS = 15 * 60
 _DEFAULT_LOCAL_SERVICE_URL = "http://localhost:8011"
+
+# --- Self-managed cognee runtime (SHARED with the Claude Code plugin) --------
+# Deliberately NOT namespaced under ~/.cognee-plugin/codex: the venv, the local
+# cognee server, and the data store are shared with the Claude Code plugin so
+# cognee is installed once and a single server serves both. Only per-plugin
+# state (logs, buffers) stays under _PLUGIN_DIR; the runtime lives at the root.
+_SHARED_PLUGIN_ROOT = Path.home() / ".cognee-plugin"
+_VENV_DIR = _SHARED_PLUGIN_ROOT / "venv"
+_VENV_PYTHON = _VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+_VENV_READY_MARKER = _SHARED_PLUGIN_ROOT / "venv-ready.json"
+
+# cognee's own default puts its databases INSIDE the install dir (the venv), so
+# they would be wiped on every venv rebuild/upgrade. Pin them to ~/.cognee.
+_COGNEE_HOME = Path.home() / ".cognee"
+_COGNEE_SYSTEM_DIR = _COGNEE_HOME / "system"
+_COGNEE_DATA_DIR = _COGNEE_HOME / "data"
+_COGNEE_CACHE_DIR = _COGNEE_HOME / "cache"
+
+
+def venv_python() -> Path:
+    """Path to the shared plugin-owned venv interpreter (may not exist yet)."""
+    return _VENV_PYTHON
+
+
+def apply_cognee_env() -> None:
+    """Pin cognee's data dirs + caching into the environment.
+
+    Uses setdefault so an explicit user/env override always wins. Called on
+    import so any process that spawns the cognee server (via os.environ.copy())
+    inherits a stable, upgrade-safe data location. CACHING is already cognee's
+    default but is set explicitly so a future default change can't disable it.
+    """
+    os.environ.setdefault("SYSTEM_ROOT_DIRECTORY", str(_COGNEE_SYSTEM_DIR))
+    os.environ.setdefault("DATA_ROOT_DIRECTORY", str(_COGNEE_DATA_DIR))
+    os.environ.setdefault("CACHE_ROOT_DIRECTORY", str(_COGNEE_CACHE_DIR))
+    os.environ.setdefault("CACHING", "true")
+
+
+apply_cognee_env()
 
 
 def _sanitize_session_key(value: str) -> str:
@@ -73,6 +128,336 @@ def set_session_key(session_key: str) -> str:
     if normalized:
         os.environ["COGNEE_SESSION_KEY"] = normalized
     return normalized
+
+
+def _generate_session_id(cwd: str = "") -> str:
+    """Mint a fresh Cognee session id for a new launch.
+
+    Shape ``{prefix}_{dirname}_{token}`` keeps it human-readable in logs while
+    the random token guarantees a new session per launch. No host/Codex session
+    id is embedded — the host id is only a local correlation key (see below).
+    """
+    prefix = _sanitize_session_key(os.environ.get("COGNEE_SESSION_PREFIX", "") or "cc") or "cc"
+    cwd = cwd or os.environ.get("CODEX_CWD") or os.getcwd()
+    dir_name = _sanitize_session_key(Path(cwd).name) or "session"
+    return f"{prefix}_{dir_name}_{uuid.uuid4().hex[:12]}"
+
+
+def _new_conn_uuid() -> str:
+    """A per-launch connection handle (liveness/counting), independent of session."""
+    return f"conn_{uuid.uuid4().hex}"
+
+
+def _session_map_path(host_key: str) -> Path:
+    return _SESSIONS_MAP_DIR / f"{_sanitize_session_key(host_key)}.json"
+
+
+def _read_map_record(host_key: str) -> dict:
+    """Return the launch record for a host session id, or {}.
+
+    Record shape: ``{conn_uuid, session_id, host_key, created_at, touched: [...]}``.
+    ``session_id`` = current Cognee session (switchable); ``conn_uuid`` = the
+    per-launch liveness handle used for registration/counting (never switched).
+    """
+    if not host_key:
+        return {}
+    try:
+        path = _session_map_path(host_key)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:
+        hook_log("session_map_read_failed", {"error": str(exc)[:200]})
+    return {}
+
+
+def _write_map_record(host_key: str, record: dict) -> None:
+    if not host_key or not isinstance(record, dict):
+        return
+    _write_json_file(_session_map_path(host_key), record)
+
+
+def _create_map_record_if_absent(host_key: str, record: dict) -> dict:
+    """Atomically create the launch record, first-writer-wins.
+
+    Uses O_CREAT|O_EXCL so exactly one concurrent creator wins; losers read back
+    the winner's record instead of clobbering it. This is what makes concurrent
+    launches/hooks for the same host_key converge on a single session id rather
+    than diverge. Returns the record now on disk.
+    """
+    if not host_key:
+        return record
+    path = _session_map_path(host_key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2, sort_keys=True)
+        return record
+    except FileExistsError:
+        return _read_map_record(host_key) or record
+    except Exception as exc:
+        hook_log("map_create_failed", {"error": str(exc)[:200]})
+        # Best-effort fallback: plain write, then read back whatever landed.
+        _write_map_record(host_key, record)
+        return _read_map_record(host_key) or record
+
+
+def resolve_cognee_session_id(host_key: str = "", cwd: str = "") -> str:
+    """Resolve the Cognee session id that scopes all saves/recalls this launch.
+
+    Precedence:
+      1. ``COGNEE_SESSION_ID`` env — explicit launch-time override.
+      2. host-keyed map record — the current session for this launch (stable
+         across the launch's separate hook processes; updated by the picker).
+      3. freshly generated id (new launch), persisted to the map.
+    """
+    explicit = _sanitize_session_key(str(os.environ.get("COGNEE_SESSION_ID", "") or "").strip())
+    if explicit:
+        return explicit
+
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    rec = _read_map_record(host_key)
+    if rec.get("session_id"):
+        return _sanitize_session_key(str(rec["session_id"]))
+
+    new_id = _generate_session_id(cwd)
+    if not host_key:
+        return new_id
+    winner = _create_map_record_if_absent(
+        host_key,
+        {
+            "session_id": new_id,
+            "host_key": host_key,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "touched": [new_id],
+        },
+    )
+    return str(winner.get("session_id") or new_id)
+
+
+def ensure_launch_record(host_key: str = "", cwd: str = "") -> tuple[str, str]:
+    """Create (first-writer-wins) and return this launch's (session_id, conn_uuid).
+
+    Called by SessionStart. The session id honors an explicit ``COGNEE_SESSION_ID``
+    override, else the existing/generated id; the conn_uuid is minted once.
+    """
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    rec = _read_map_record(host_key)
+    if rec.get("session_id") and rec.get("conn_uuid"):
+        return str(rec["session_id"]), str(rec["conn_uuid"])
+
+    explicit = _sanitize_session_key(str(os.environ.get("COGNEE_SESSION_ID", "") or "").strip())
+    session_id = explicit or str(rec.get("session_id") or "") or _generate_session_id(cwd)
+    conn_uuid = str(rec.get("conn_uuid") or "") or _new_conn_uuid()
+    record = {
+        "session_id": session_id,
+        "conn_uuid": conn_uuid,
+        "host_key": host_key,
+        "created_at": rec.get("created_at")
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "touched": rec.get("touched") or [session_id],
+    }
+    if not host_key:
+        return session_id, conn_uuid
+    winner = _create_map_record_if_absent(host_key, record)
+    # If a prior resolve() created a session-only record (no handle), graft our
+    # conn_uuid onto it. SessionStart is the sole writer of conn_uuid, so this
+    # merge isn't contended in practice.
+    if not winner.get("conn_uuid"):
+        merged = dict(winner)
+        merged["conn_uuid"] = conn_uuid
+        merged.setdefault("host_key", host_key)
+        _write_map_record(host_key, merged)
+        winner = _read_map_record(host_key) or merged
+    return str(winner.get("session_id") or session_id), str(winner.get("conn_uuid") or conn_uuid)
+
+
+def resolve_conn_uuid(host_key: str = "") -> str:
+    """Return this launch's connection handle, minting+persisting one if absent."""
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    rec = _read_map_record(host_key)
+    cu = str(rec.get("conn_uuid") or "")
+    if cu:
+        return cu
+    cu = _new_conn_uuid()
+    if host_key:
+        rec = _read_map_record(host_key)
+        if not rec.get("conn_uuid"):
+            rec["conn_uuid"] = cu
+            rec.setdefault("host_key", host_key)
+            _write_map_record(host_key, rec)
+        return str(_read_map_record(host_key).get("conn_uuid") or cu)
+    return cu
+
+
+def set_mapped_session(host_key: str, new_session_id: str) -> tuple[str, str]:
+    """Switch this launch's Cognee session id. Returns (old_session_id, new_session_id).
+
+    Updates only ``session_id`` (and appends to ``touched``); ``conn_uuid`` is left
+    intact so registration/counting is unaffected by the switch.
+    """
+    host_key = _sanitize_session_key(host_key)
+    new_session_id = _sanitize_session_key(new_session_id)
+    if not host_key or not new_session_id:
+        return "", ""
+    rec = _read_map_record(host_key)
+    old = str(rec.get("session_id") or "")
+    rec["session_id"] = new_session_id
+    touched = rec.get("touched") if isinstance(rec.get("touched"), list) else []
+    for sid in (old, new_session_id):
+        if sid and sid not in touched:
+            touched.append(sid)
+    rec["touched"] = touched
+    rec.setdefault("host_key", host_key)
+    _write_map_record(host_key, rec)
+    return old, new_session_id
+
+
+def mapped_touched_sessions(host_key: str = "") -> list:
+    """All Cognee session ids this launch has used (for end-of-launch sync sweep)."""
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    rec = _read_map_record(host_key)
+    touched = rec.get("touched") if isinstance(rec.get("touched"), list) else []
+    current = str(rec.get("session_id") or "")
+    out = [str(s) for s in touched if s]
+    if current and current not in out:
+        out.append(current)
+    return out
+
+
+def sanitize_session_id(value: str) -> str:
+    """Public: normalize a user-supplied session id the same way the map does."""
+    return _sanitize_session_key(value)
+
+
+def mapped_session_id(host_key: str = "") -> str:
+    """Public: current Cognee session id for a launch, or '' (no map write)."""
+    host_key = _sanitize_session_key(host_key) or get_session_key()
+    return str(_read_map_record(host_key).get("session_id") or "")
+
+
+# --- Launch <-> host-pid bridge (for model-invoked commands) -----------------
+# A skill/command's shell has no session id in its environment, so it discovers
+# its launch by walking the process tree to the host (claude/codex) pid, then
+# reading the host_key recorded here at SessionStart.
+_HOST_EXECUTABLE_HINTS = ("claude", "codex")
+
+
+def write_launch_pid_map(host_pid: int, host_key: str) -> None:
+    if not host_pid or not host_key:
+        return
+    _write_json_file(
+        _LAUNCHES_DIR / f"{int(host_pid)}.json",
+        {
+            "host_key": _sanitize_session_key(host_key),
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
+def read_host_key_for_pid(host_pid: int) -> str:
+    try:
+        path = _LAUNCHES_DIR / f"{int(host_pid)}.json"
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return _sanitize_session_key(str(data.get("host_key") or ""))
+    except Exception as exc:
+        hook_log("launch_pid_read_failed", {"error": str(exc)[:200]})
+    return ""
+
+
+def find_host_pid(names: tuple = _HOST_EXECUTABLE_HINTS) -> int:
+    """Walk up from this process to the host (claude/codex) pid. 0 if not found.
+
+    Matches the host name as the executable basename anywhere in the command
+    line via a path-boundary regex, so it is robust to spaces in the executable
+    path (e.g. ``/…/Application Support/…/codex``), which a naive
+    ``command.split()[0]`` would mis-tokenize.
+    """
+    import re
+    import subprocess
+
+    try:
+        raw = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,command="], text=True, stderr=subprocess.DEVNULL
+        )
+    except Exception as exc:
+        hook_log("find_host_pid_ps_failed", {"error": str(exc)[:200]})
+        return 0
+    name_alt = "|".join(re.escape(n) for n in names)
+    # Name preceded by start-or-"/", optional "-<version>" suffix, then ws/end.
+    host_re = re.compile(rf"(?:^|/)(?:{name_alt})(?:-[\w.]+)?(?:\s|$)")
+    table: dict = {}
+    for line in raw.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        table[pid] = (ppid, parts[2])
+    pid = os.getpid()
+    seen: set = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        ppid, command = table.get(pid, (0, ""))
+        if command and host_re.search(command):
+            return pid
+        pid = ppid
+    return 0
+
+
+# --- Session listing + count cache (for the picker and status line) ----------
+def list_sessions_via_http(limit: int = 200, range_: str = "all", timeout: float = 10.0) -> dict:
+    """GET /api/v1/sessions for the principal. Returns {sessions, total, ...} or {}."""
+    query = f"?limit={int(limit)}&range={urllib.parse.quote(range_)}"
+    result = _json_http_request(f"/api/v1/sessions{query}", method="GET", timeout=timeout)
+    return result if isinstance(result, dict) else {}
+
+
+def sessions_count_get() -> Optional[int]:
+    """Last cached total session count (no network). None if never refreshed."""
+    data = _load_json_file(_SESSIONS_COUNT_CACHE)
+    if isinstance(data, dict) and "total" in data:
+        try:
+            return int(data.get("total"))
+        except Exception:
+            return None
+    return None
+
+
+def _sessions_count_fresh() -> bool:
+    data = _load_json_file(_SESSIONS_COUNT_CACHE)
+    if not (isinstance(data, dict) and "total" in data):
+        return False
+    try:
+        age = datetime.now(timezone.utc).timestamp() - float(data.get("ts", 0) or 0)
+        return age < _SESSIONS_COUNT_TTL_SECONDS
+    except Exception:
+        return False
+
+
+def sessions_count_refresh(force: bool = False) -> Optional[int]:
+    """Refresh the cached session count if stale (best-effort). Returns the count."""
+    if not force and _sessions_count_fresh():
+        return sessions_count_get()
+    try:
+        data = list_sessions_via_http(limit=1)
+        if isinstance(data, dict) and "total" in data:
+            total = int(data.get("total") or 0)
+            _write_json_file(
+                _SESSIONS_COUNT_CACHE,
+                {"total": total, "ts": datetime.now(timezone.utc).timestamp()},
+            )
+            return total
+    except Exception as exc:
+        hook_log("sessions_count_refresh_failed", {"error": str(exc)[:200]})
+    return sessions_count_get()
 
 
 def resolve_session_key_from_payload(payload: dict) -> tuple[str, str]:
@@ -145,6 +530,14 @@ def load_resolved(session_key: str = "") -> dict:
     if active_session_key:
         resolved["session_key"] = active_session_key
 
+    # session_id = data scoping key (switchable); conn_uuid = registration handle.
+    cognee_session_id = resolve_cognee_session_id(active_session_key)
+    if cognee_session_id:
+        resolved["session_id"] = cognee_session_id
+    conn_uuid = resolve_conn_uuid(active_session_key)
+    if conn_uuid:
+        resolved["agent_session_name"] = conn_uuid
+
     service_url = _local_api_url().strip()
     if service_url:
         resolved["service_url"] = service_url
@@ -163,11 +556,13 @@ def load_resolved(session_key: str = "") -> dict:
     except Exception as exc:
         hook_log("runtime_state_users_me_failed", {"error": str(exc)[:200]})
 
-    # Resolve active connection details for this session when possible.
+    # Resolve active connection details. The connection is registered under the
+    # per-launch conn_uuid handle, so query by that — not the session id (which
+    # can change on a switch) and not the host correlation key.
     try:
         query = ""
-        if active_session_key:
-            query = f"?agent_session_name={urllib.parse.quote(active_session_key, safe='')}"
+        if conn_uuid:
+            query = f"?agent_session_name={urllib.parse.quote(conn_uuid, safe='')}"
         conn = _json_http_request(
             f"/api/v1/agents/connections/me{query}",
             method="GET",
@@ -176,9 +571,8 @@ def load_resolved(session_key: str = "") -> dict:
         if isinstance(conn, dict):
             agent = conn.get("agent") if isinstance(conn.get("agent"), dict) else {}
             if isinstance(agent, dict):
-                session_id = str(agent.get("session_id") or "").strip()
-                if session_id:
-                    resolved["session_id"] = session_id
+                # Do not overwrite resolved["session_id"] from the connection: the
+                # local map is authoritative for the *current* session (post-switch).
                 agent_session_name = str(agent.get("agent_session_name") or "").strip()
                 if agent_session_name:
                     resolved["agent_session_name"] = agent_session_name
@@ -326,6 +720,42 @@ def hook_log(event: str, detail: Optional[dict] = None) -> None:
             fh.write(serialized + "\n")
     except Exception:
         pass
+
+
+def _reexec_into_venv() -> None:
+    """Re-exec the current hook under the shared plugin-owned venv interpreter.
+
+    Hooks are launched by the host as ``python3 <script>`` using whatever
+    python3 is on PATH — which has neither cognee nor aiohttp. The runtime
+    lives in ``~/.cognee-plugin/venv``. Once that venv exists, re-exec into it
+    so every import resolves there. No-op before the venv exists (cold start,
+    pre-install) or when already running inside it.
+    """
+    if os.environ.get("COGNEE_PLUGIN_IN_VENV") == "1":
+        return  # loop guard: this process already re-execed (or opted out)
+    if not sys.argv or not os.path.isfile(sys.argv[0]):
+        return  # not a `python script.py` launch (e.g. -c/-m/stdin) — don't rebuild argv
+    vpy = _VENV_PYTHON
+    if not vpy.exists():
+        return  # cold start — install hasn't built the venv yet
+    os.environ["COGNEE_PLUGIN_IN_VENV"] = "1"
+    try:
+        if os.path.samefile(str(vpy), sys.executable):
+            return  # the host python3 already *is* the venv interpreter
+    except OSError:
+        pass
+    try:
+        # execv inherits os.environ (incl. the loop guard just set above).
+        os.execv(str(vpy), [str(vpy), *sys.argv])
+    except OSError as exc:
+        # Better to run degraded under the host interpreter than to die.
+        hook_log("venv_reexec_failed", {"error": str(exc)[:200]})
+
+
+# Fired on import: every cognee-touching hook imports this module before any
+# aiohttp/cognee import, so this is the single chokepoint that pins all hooks
+# to the venv runtime once it exists.
+_reexec_into_venv()
 
 
 def _verbose_enabled() -> bool:
@@ -593,45 +1023,62 @@ def _normalize_service_url(value: str) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+def load_cached_api_key(service_url: str = "") -> str:
+    """Return the single cached principal key (matching service_url if recorded)."""
+    data = _load_json_file(_API_KEY_CACHE)
+    if not isinstance(data, dict):
+        return ""
+    key = str(data.get("api_key") or "").strip()
+    if not key:
+        return ""
+    cached_url = _normalize_service_url(str(data.get("service_url") or ""))
+    wanted = _normalize_service_url(service_url)
+    if wanted and cached_url and cached_url != wanted:
+        return ""
+    return key
+
+
+def save_cached_api_key(service_url: str, key: str) -> None:
+    """Persist the single principal key (env key takes precedence at read time)."""
+    if not str(key or "").strip():
+        return
+    _write_json_file(
+        _API_KEY_CACHE,
+        {
+            "service_url": _normalize_service_url(service_url),
+            "api_key": str(key).strip(),
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
 def _api_key() -> str:
+    """Resolve the single principal API key.
+
+    Single-principal model: one key for everything. Order:
+      1. ``COGNEE_API_KEY`` env (user-provided, or set in-process after minting).
+      2. The single cached key (``api_key.json``), minted once from the default
+         user by SessionStart when no key was provided.
+    No per-agent keys, no agent-name keying.
+    """
+    env_key = str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+    if env_key:
+        return env_key
+
     service_url = _normalize_service_url(_local_api_url())
-    agent_name = _resolve_agent_name()
-    if not service_url:
-        return str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+    cached = load_cached_api_key(service_url)
+    if cached:
+        os.environ["COGNEE_API_KEY"] = cached
+        return cached
 
-    cache = _load_json_file(_AGENT_KEYS_CACHE)
-    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-    if isinstance(entries, dict) and agent_name:
-        selected: dict | None = None
-        cache_key = f"{service_url}::{agent_name}"
-        entry = entries.get(cache_key)
-        if isinstance(entry, dict):
-            selected = entry
-        else:
-            # Backward compatibility for older cache formats where keys may differ.
-            for value in entries.values():
-                if not isinstance(value, dict):
-                    continue
-                url = _normalize_service_url(str(value.get("service_url") or ""))
-                name = str(value.get("agent_name") or "").strip()
-                if url == service_url and name == agent_name:
-                    selected = value
-                    break
-        if isinstance(selected, dict):
-            key = str(selected.get("api_key") or "").strip()
-            if key:
-                os.environ["COGNEE_API_KEY"] = key
-                return key
-
-    # Fallback for bootstrap paths before an agent key is available.
-    return str(os.environ.get("COGNEE_API_KEY", "") or "").strip()
+    return ""
 
 
 def resolved_http_endpoint_auth() -> tuple[str, str]:
     """Return (service_url, api_key) for runtime HTTP calls.
 
-    Service URL always falls back to localhost. API key is resolved from env
-    first, then from agent_keys cache by (service_url, agent_name).
+    Service URL always falls back to localhost. API key is the single principal
+    key: env first, then the single cached key.
     """
     service_url = _normalize_service_url(_local_api_url())
     api_key = _api_key().strip()

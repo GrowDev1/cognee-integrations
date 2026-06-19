@@ -240,17 +240,44 @@ def _load_resolved() -> tuple:
     )
 
 
-async def _sync(stop_watcher: bool, unregister_on_finish: bool = False):
+def _target_sessions(default_session_id: str, host_key: str, switch_sync: bool) -> list:
+    """Which Cognee sessions this sync should flush.
+
+    - switch sync: only the outgoing session (the one being left).
+    - final/exit/manual sync: every session this launch touched (current +
+      history), so a mid-session switch never leaves the final session unsynced.
+      Re-flushing already-synced sessions is safe — the bridge dedupes by content.
+    """
+    if switch_sync:
+        return [default_session_id] if default_session_id else []
+    touched: list = []
+    try:
+        from _plugin_common import mapped_touched_sessions
+
+        touched = mapped_touched_sessions(host_key) if host_key else []
+    except Exception as exc:
+        hook_log("target_sessions_touched_failed", {"error": str(exc)[:200]})
+    out: list = []
+    for sid in [default_session_id, *touched]:
+        if sid and sid not in out:
+            out.append(sid)
+    return out
+
+
+async def _sync(stop_watcher: bool, unregister_on_finish: bool = False, switch_sync: bool = False):
     session_id, dataset, user_id, agent_session_name, was_registered, has_api_key, session_key = (
         _load_resolved()
     )
+    target_sessions = _target_sessions(session_id, session_key, switch_sync)
     hook_log(
         "sync_start",
         {
             "session": session_id,
+            "targets": target_sessions,
             "dataset": dataset,
             "user_id": user_id,
             "stop_watcher": stop_watcher,
+            "switch_sync": switch_sync,
         },
     )
 
@@ -268,46 +295,50 @@ async def _sync(stop_watcher: bool, unregister_on_finish: bool = False):
                 print("cognee-sync: skipped, another sync is running", file=sys.stderr)
                 return
 
+            if not target_sessions:
+                hook_log("sync_no_target_sessions", {"dataset": dataset})
+                return
+
             if api_mode:
-                wrote = persist_session_cache_to_graph_via_http(dataset, session_id)
-                hook_log(
-                    "sync_bridge_done",
-                    {
-                        "session": session_id,
-                        "dataset": dataset,
-                        "via": "http_remember",
-                        "wrote": wrote,
-                    },
-                )
-                print(
-                    "cognee-sync: "
-                    f"dataset={dataset} session={session_id} via=http_remember wrote={wrote}",
-                    file=sys.stderr,
-                )
+                for sid in target_sessions:
+                    wrote = persist_session_cache_to_graph_via_http(dataset, sid)
+                    hook_log(
+                        "sync_bridge_done",
+                        {
+                            "session": sid,
+                            "dataset": dataset,
+                            "via": "http_remember",
+                            "wrote": wrote,
+                        },
+                    )
+                    print(
+                        f"cognee-sync: dataset={dataset} session={sid} "
+                        f"via=http_remember wrote={wrote}",
+                        file=sys.stderr,
+                    )
                 return
 
             await ensure_cognee_ready(config)
             user = await resolve_user(user_id)
             await ensure_dataset_ready(dataset, user)
-            wrote = await persist_session_cache_to_graph(dataset, session_id, user)
-            graph_result = await sync_graph_context_to_session(dataset, session_id, user)
-
-            hook_log(
-                "sync_bridge_done",
-                {
-                    "session": session_id,
-                    "dataset": dataset,
-                    "user_id": str(getattr(user, "id", "")),
-                    "wrote": wrote,
-                    "graph_synced": graph_result.get("synced", 0),
-                },
-            )
-            print(
-                "cognee-sync: "
-                f"dataset={dataset} session={session_id} wrote={wrote} "
-                f"graph_synced={graph_result.get('synced', 0)}",
-                file=sys.stderr,
-            )
+            for sid in target_sessions:
+                wrote = await persist_session_cache_to_graph(dataset, sid, user)
+                graph_result = await sync_graph_context_to_session(dataset, sid, user)
+                hook_log(
+                    "sync_bridge_done",
+                    {
+                        "session": sid,
+                        "dataset": dataset,
+                        "user_id": str(getattr(user, "id", "")),
+                        "wrote": wrote,
+                        "graph_synced": graph_result.get("synced", 0),
+                    },
+                )
+                print(
+                    f"cognee-sync: dataset={dataset} session={sid} wrote={wrote} "
+                    f"graph_synced={graph_result.get('synced', 0)}",
+                    file=sys.stderr,
+                )
     finally:
         if unregister_on_finish:
             if not (was_registered or has_api_key):
@@ -361,6 +392,11 @@ def main():
         },
     )
 
+    # A switch sync (fired by the picker when leaving a session) is a distinct,
+    # mid-session event: it must not be deduped against the once-per-launch final
+    # sync, must not stop the watcher, and must never unregister.
+    switch_sync = os.environ.get("COGNEE_SWITCH_SYNC", "").lower() in ("1", "true", "yes")
+
     if detached_final:
         delay_raw = os.environ.get("COGNEE_SYNC_START_DELAY", "")
         try:
@@ -370,13 +406,15 @@ def main():
         if delay > 0:
             hook_log("sync_start_delayed", {"seconds": delay})
             time.sleep(delay)
-        if not _claim_final_sync_once():
+        if not switch_sync and not _claim_final_sync_once():
             hook_log("sync_detached_skipped_duplicate")
             return
 
-    unregister_on_finish = detached_final and os.environ.get(
-        "COGNEE_UNREGISTER_ON_FINISH", ""
-    ).lower() in ("1", "true", "yes")
+    unregister_on_finish = (
+        detached_final
+        and not switch_sync
+        and os.environ.get("COGNEE_UNREGISTER_ON_FINISH", "").lower() in ("1", "true", "yes")
+    )
 
     # Only a true SessionEnd should stop the watcher. Manual syncs and
     # slash-command invocations happen mid-session, and killing the watcher
@@ -397,7 +435,13 @@ def main():
 
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            asyncio.run(_sync(stop_watcher=False, unregister_on_finish=unregister_on_finish))
+            asyncio.run(
+                _sync(
+                    stop_watcher=False,
+                    unregister_on_finish=unregister_on_finish,
+                    switch_sync=switch_sync,
+                )
+            )
             return
         except Exception as exc:
             # Non-fatal: session sync failure should not crash Codex.

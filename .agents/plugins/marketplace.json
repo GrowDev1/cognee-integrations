@@ -1,14 +1,16 @@
 {
-  "name": "cognee-local",
+  "name": "cognee",
   "interface": {
-    "displayName": "Cognee Local Plugins"
+    "displayName": "Cognee"
   },
   "plugins": [
     {
       "name": "cognee",
       "source": {
-        "source": "local",
-        "path": "./plugins/cognee"
+        "source": "git-subdir",
+        "url": "https://github.com/topoteretes/cognee-integrations.git",
+        "path": "./integrations/codex/plugins/cognee",
+        "ref": "main"
       },
       "policy": {
         "installation": "AVAILABLE",

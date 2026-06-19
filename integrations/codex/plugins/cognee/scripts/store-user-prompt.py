@@ -30,6 +30,7 @@ from _plugin_common import (
     resolve_session_key_from_payload,
     resolve_user,
     server_ready_hint,
+    sessions_count_refresh,
     set_session_key,
     touch_activity,
 )
@@ -156,6 +157,13 @@ async def _store(prompt: str, payload: dict):
     hook_log("prompt_pending", {"chars": len(prompt), "turn_id": payload.get("turn_id")})
     notify(f"user prompt pending ({len(prompt)} chars)")
     bump_save_counter(session_id, "prompt")
+
+    # Keep the status line's "(+N more)" count fresh. TTL-gated + best-effort, so
+    # it makes at most one cheap GET /sessions per minute and never blocks.
+    try:
+        sessions_count_refresh()
+    except Exception as exc:
+        hook_log("sessions_count_refresh_warning", {"error": str(exc)[:200]})
 
 
 def main():

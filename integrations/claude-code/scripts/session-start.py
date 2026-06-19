@@ -10,7 +10,6 @@ Runs on the SessionStart hook. Responsibilities:
 """
 
 import asyncio
-import hashlib
 import json
 import os
 import shutil
@@ -22,7 +21,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Add scripts dir to path for config import
@@ -36,6 +34,7 @@ from _plugin_common import (
     _VENV_READY_MARKER,
     _reexec_into_venv,
     apply_cognee_env,
+    ensure_launch_record,
     hook_log,
     mark_server_ready,
     quiet_hook_output,
@@ -44,14 +43,15 @@ from _plugin_common import (
     server_ready_hint,
     set_session_key,
     touch_activity,
+    write_launch_pid_map,
 )
 from config import (
+    _user_id_via_api,
     ensure_cognee_ready,
     ensure_dataset_ready,
     ensure_dataset_ready_via_api,
     ensure_identity,
     get_dataset,
-    get_session_id,
     is_cloud_mode,
     load_config,
     save_config,
@@ -64,15 +64,6 @@ _WATCHER_STOP = _STATE_DIR / "watcher.stop"
 _WATCHER_SCRIPT = Path(__file__).with_name("idle-watcher.py")
 _EXIT_WATCHER_SCRIPT = Path(__file__).with_name("exit-watcher.py")
 _EXIT_WATCHERS_DIR = _STATE_DIR / "exit-watchers"
-_AGENT_KEYS_CACHE = _STATE_DIR / "agent_keys.json"
-_AGENT_KEYS_LOCK = _STATE_DIR / "agent_keys.lock"
-_AGENT_KEYS_LOCK_STALE_SECONDS = 120
-_AGENT_KEYS_LOCK_WAIT_SECONDS = 4.0
-_AGENT_KEYS_LOCK_POLL_SECONDS = 0.05
-_AGENT_LIFECYCLE_LOCKS_DIR = _STATE_DIR / "agent_lifecycle_locks"
-_AGENT_LIFECYCLE_LOCK_STALE_SECONDS = 120
-_AGENT_LIFECYCLE_LOCK_WAIT_SECONDS = 20.0
-_AGENT_LIFECYCLE_LOCK_POLL_SECONDS = 0.05
 _LOCAL_SERVICE_URL = "http://localhost:8011"
 _HEALTH_URL = f"{_LOCAL_SERVICE_URL}/health"
 _HEALTH_TIMEOUT_SECONDS = 30
@@ -198,7 +189,9 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
         try:
             directory.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            hook_log("cognee_data_dir_mkdir_failed", {"dir": str(directory), "error": str(exc)[:200]})
+            hook_log(
+                "cognee_data_dir_mkdir_failed", {"dir": str(directory), "error": str(exc)[:200]}
+            )
 
     owner = f"install:{os.getpid()}"
     acquired = False
@@ -447,18 +440,6 @@ def _ensure_local_server_running(
                 hook_log("server_bootstrap_lock_release_failed", {"error": str(exc)[:200]})
 
 
-def _load_agent_keys_cache() -> dict:
-    empty = {"version": 1, "entries": {}}
-    try:
-        if _AGENT_KEYS_CACHE.exists():
-            data = json.loads(_AGENT_KEYS_CACHE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("entries"), dict):
-                return data
-    except Exception as exc:
-        hook_log("agent_keys_cache_load_failed", {"error": str(exc)[:200]})
-    return empty
-
-
 def _pid_alive(pid: int) -> bool:
     if pid <= 1:
         return False
@@ -473,122 +454,8 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-@contextmanager
-def _agent_keys_lock(owner: str):
-    acquired = False
-    deadline = time.monotonic() + _AGENT_KEYS_LOCK_WAIT_SECONDS
-    try:
-        _AGENT_KEYS_LOCK.parent.mkdir(parents=True, exist_ok=True)
-        while True:
-            now = time.time()
-            if _AGENT_KEYS_LOCK.exists():
-                stale = False
-                try:
-                    raw = json.loads(_AGENT_KEYS_LOCK.read_text(encoding="utf-8"))
-                    pid = int(raw.get("pid", 0) or 0)
-                    created_at = float(raw.get("created_at", 0) or 0)
-                    stale = (not _pid_alive(pid)) or (
-                        now - created_at > _AGENT_KEYS_LOCK_STALE_SECONDS
-                    )
-                except Exception:
-                    stale = True
-                if stale:
-                    try:
-                        _AGENT_KEYS_LOCK.unlink()
-                    except Exception as exc:
-                        hook_log("agent_keys_lock_unlink_failed", {"error": str(exc)[:200]})
-
-            try:
-                fd = os.open(str(_AGENT_KEYS_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
-                acquired = True
-                break
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("agent keys lock timeout")
-                time.sleep(_AGENT_KEYS_LOCK_POLL_SECONDS)
-
-        yield
-    finally:
-        if acquired:
-            try:
-                _AGENT_KEYS_LOCK.unlink()
-            except Exception as exc:
-                hook_log("agent_keys_lock_release_failed", {"error": str(exc)[:200]})
-
-
-def _save_agent_keys_cache(data: dict) -> None:
-    try:
-        _AGENT_KEYS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _AGENT_KEYS_CACHE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, _AGENT_KEYS_CACHE)
-    except Exception as exc:
-        hook_log("agent_keys_cache_save_failed", {"error": str(exc)[:200]})
-
-
 def _normalize_service_url(service_url: str) -> str:
     return str(service_url or "").strip().rstrip("/")
-
-
-def _agent_cache_key(service_url: str, agent_name: str) -> str:
-    return f"{_normalize_service_url(service_url)}::{agent_name}"
-
-
-def _utc_iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _agent_lifecycle_lock_path(service_url: str, agent_name: str) -> Path:
-    lock_key = _agent_cache_key(service_url, agent_name)
-    digest = hashlib.sha256(lock_key.encode("utf-8")).hexdigest()[:32]
-    return _AGENT_LIFECYCLE_LOCKS_DIR / f"{digest}.lock"
-
-
-@contextmanager
-def _agent_lifecycle_lock(service_url: str, agent_name: str, owner: str):
-    acquired = False
-    lock_path = _agent_lifecycle_lock_path(service_url, agent_name)
-    deadline = time.monotonic() + _AGENT_LIFECYCLE_LOCK_WAIT_SECONDS
-    try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        while True:
-            now = time.time()
-            if lock_path.exists():
-                stale = False
-                try:
-                    raw = json.loads(lock_path.read_text(encoding="utf-8"))
-                    pid = int(raw.get("pid", 0) or 0)
-                    created_at = float(raw.get("created_at", 0) or 0)
-                    stale = (not _pid_alive(pid)) or (
-                        now - created_at > _AGENT_LIFECYCLE_LOCK_STALE_SECONDS
-                    )
-                except Exception:
-                    stale = True
-                if stale:
-                    try:
-                        lock_path.unlink()
-                    except Exception as exc:
-                        hook_log("agent_lifecycle_lock_unlink_failed", {"error": str(exc)[:200]})
-
-            try:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
-                acquired = True
-                break
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("agent lifecycle lock timeout")
-                time.sleep(_AGENT_LIFECYCLE_LOCK_POLL_SECONDS)
-        yield
-    finally:
-        if acquired:
-            try:
-                lock_path.unlink()
-            except Exception as exc:
-                hook_log("agent_lifecycle_lock_release_failed", {"error": str(exc)[:200]})
 
 
 async def _login_default_user_for_owner_api_key(service_url: str, config: dict) -> str:
@@ -661,97 +528,22 @@ def _resolve_agent_name(config: dict, cwd: str) -> str:
     return _normalize(f"claude-{Path(cwd).name}")
 
 
-async def _create_agent_with_bootstrap_key(
-    service_url: str,
-    agent_name: str,
-    bootstrap_key: str,
-) -> tuple[str, str]:
-    import aiohttp
+async def _resolve_single_principal_key(service_url: str, config: dict) -> str:
+    """Resolve the one API key for this deployment.
 
-    async def _delete_agent_by_name(
-        session: aiohttp.ClientSession, base_url: str, name: str
-    ) -> bool:
-        async with session.get(f"{base_url}/api/v1/agents/list") as list_resp:
-            if list_resp.status != 200:
-                body = await list_resp.text()
-                raise RuntimeError(f"list agents failed ({list_resp.status}: {body[:200]})")
-            agents = await list_resp.json()
+    Order: env ``COGNEE_API_KEY`` -> single cached key -> mint once from the
+    default user (and cache it). No per-agent users or keys.
+    """
+    from _plugin_common import load_cached_api_key, save_cached_api_key
 
-        target_id = ""
-        for item in agents if isinstance(agents, list) else []:
-            if not isinstance(item, dict):
-                continue
-            email = str(item.get("agentEmail", "") or "").strip()
-            short_name = email[:-13] if email.endswith("@cognee.agent") else email
-            if short_name == name:
-                target_id = str(item.get("agentId", "") or "").strip()
-                break
-
-        if not target_id:
-            return False
-
-        async with session.delete(f"{base_url}/api/v1/agents/{target_id}") as del_resp:
-            if del_resp.status not in (200, 204):
-                body = await del_resp.text()
-                raise RuntimeError(f"delete agent failed ({del_resp.status}: {body[:200]})")
-        return True
-
-    def _parse_create_payload(payload: dict) -> tuple[str, str]:
-        return (
-            str(payload.get("agentId", "") or ""),
-            str(payload.get("agentApiKey", "") or ""),
-        )
-
-    headers = {"Content-Type": "application/json"}
-    if bootstrap_key:
-        headers["X-Api-Key"] = bootstrap_key
-
-    base = service_url.rstrip("/")
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.post(
-            f"{base}/api/v1/agents/create", params={"name": agent_name}
-        ) as resp:
-            if resp.status == 200:
-                payload = await resp.json()
-                return _parse_create_payload(payload)
-            if resp.status == 409:
-                deleted = await _delete_agent_by_name(session, base, agent_name)
-                if not deleted:
-                    raise RuntimeError(
-                        f"Agent '{agent_name}' already exists on {base}, "
-                        "but it could not be resolved for deletion."
-                    )
-                async with session.post(
-                    f"{base}/api/v1/agents/create", params={"name": agent_name}
-                ) as retry_resp:
-                    if retry_resp.status == 200:
-                        payload = await retry_resp.json()
-                        return _parse_create_payload(payload)
-                    text = await retry_resp.text()
-                    raise RuntimeError(
-                        f"create_agent retry failed ({retry_resp.status}: {text[:200]})"
-                    )
-            text = await resp.text()
-            raise RuntimeError(f"create_agent failed ({resp.status}: {text[:200]})")
-
-
-async def _agent_api_key_is_valid(service_url: str, api_key: str) -> bool:
-    import aiohttp
-
-    base = _normalize_service_url(service_url)
-    if not base or not str(api_key or "").strip():
-        return False
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers={"X-Api-Key": str(api_key).strip()},
-        ) as session:
-            async with session.get(f"{base}/api/v1/users/me") as resp:
-                return resp.status == 200
-    except Exception as exc:
-        hook_log("agent_key_validation_failed", {"error": str(exc)[:200]})
-        return False
+    api_key = str(config.get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")).strip()
+    if not api_key:
+        api_key = load_cached_api_key(service_url)
+    if not api_key:
+        api_key = await _login_default_user_for_owner_api_key(service_url, config)
+        if api_key:
+            save_cached_api_key(service_url, api_key)
+    return api_key
 
 
 async def _ensure_agent_credentials_and_register(
@@ -761,120 +553,40 @@ async def _ensure_agent_credentials_and_register(
     if not service_url:
         return "", "", "", False
 
-    agent_name = _resolve_agent_name(config, cwd)
-    cache_key = _agent_cache_key(service_url, agent_name)
-    agent_id = ""
-    agent_api_key = ""
-    registered = False
-    registration: dict = {}
-    lifecycle_owner = f"session-start:lifecycle:{os.getpid()}"
-    with _agent_lifecycle_lock(service_url, agent_name, lifecycle_owner):
-        with _agent_keys_lock("session-start:read"):
-            cache = _load_agent_keys_cache()
-            entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-            cached = entries.get(cache_key, {}) if isinstance(entries, dict) else {}
-            agent_id = str(cached.get("agent_id", "") or "")
-            agent_api_key = str(cached.get("api_key", "") or "")
-            if agent_api_key:
-                cached["last_used_at"] = _utc_iso_now()
-                entries[cache_key] = cached
-                cache["entries"] = entries
-                _save_agent_keys_cache(cache)
+    api_key = await _resolve_single_principal_key(service_url, config)
+    if not api_key:
+        return "", "", "", False
 
-        if agent_api_key:
-            key_valid = await _agent_api_key_is_valid(service_url, agent_api_key)
-            if not key_valid:
-                hook_log(
-                    "agent_key_stale_detected",
-                    {"agent_name": agent_name, "service_url": service_url},
-                )
-                agent_id = ""
-                agent_api_key = ""
-                with _agent_keys_lock("session-start:invalidate-stale"):
-                    cache = _load_agent_keys_cache()
-                    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-                    if isinstance(entries, dict):
-                        entries.pop(cache_key, None)
-                        cache["entries"] = entries
-                        _save_agent_keys_cache(cache)
-            else:
-                with _agent_keys_lock("session-start:touch-last-used"):
-                    cache = _load_agent_keys_cache()
-                    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-                    latest = entries.get(cache_key, {}) if isinstance(entries, dict) else {}
-                    if isinstance(latest, dict):
-                        latest["last_used_at"] = _utc_iso_now()
-                        entries[cache_key] = latest
-                        cache["entries"] = entries
-                        _save_agent_keys_cache(cache)
+    os.environ["COGNEE_API_KEY"] = api_key
+    config["api_key"] = api_key
 
-        created_agent_id = ""
-        created_key = ""
-        if not agent_api_key:
-            bootstrap_key = str(
-                config.get("api_key", "") or os.environ.get("COGNEE_API_KEY", "")
-            ).strip()
-            if not bootstrap_key:
-                bootstrap_key = await _login_default_user_for_owner_api_key(service_url, config)
-            created_agent_id, created_key = await _create_agent_with_bootstrap_key(
-                service_url, agent_name, bootstrap_key
-            )
-            if created_key:
-                agent_id = created_agent_id
-                agent_api_key = created_key
-                with _agent_keys_lock("session-start:write"):
-                    cache = _load_agent_keys_cache()
-                    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-                    latest = entries.get(cache_key, {}) if isinstance(entries, dict) else {}
-                    latest_key = str(latest.get("api_key", "") or "")
-                    if latest_key:
-                        agent_id = str(latest.get("agent_id", "") or "") or agent_id
-                        agent_api_key = latest_key
-                        latest["last_used_at"] = _utc_iso_now()
-                        entries[cache_key] = latest
-                    else:
-                        entries[cache_key] = {
-                            "agent_id": agent_id,
-                            "agent_name": agent_name,
-                            "api_key": agent_api_key,
-                            "service_url": service_url,
-                            "created_at": _utc_iso_now(),
-                            "last_used_at": _utc_iso_now(),
-                        }
-                    cache["entries"] = entries
-                    _save_agent_keys_cache(cache)
+    # The principal user id (best-effort) — used for dataset readiness + watchers.
+    user_id = await _user_id_via_api(service_url, api_key)
 
-        if not agent_api_key:
-            return "", "", agent_name, False
+    from _plugin_common import register_agent_via_http
 
-        os.environ["COGNEE_API_KEY"] = agent_api_key
-        config["api_key"] = agent_api_key
+    # Registration is now purely a lifecycle counter + connection registry under
+    # the single principal. The connection handle IS the Cognee session id.
+    registered, registration = register_agent_via_http(
+        agent_session_name=agent_session_name,
+        session_id=session_id,
+        dataset_names=[str(config.get("dataset", "") or "").strip()],
+    )
+    if not registered:
+        raise RuntimeError(f"Failed to register session '{session_id}' on {service_url}.")
 
-        from _plugin_common import register_agent_via_http
-
-        registered, registration = register_agent_via_http(
-            agent_session_name=agent_session_name,
-            session_id=session_id,
-            dataset_names=[str(config.get("dataset", "") or "").strip()],
-        )
-        if not registered:
-            raise RuntimeError(
-                f"Failed to register agent '{agent_name}' on {service_url}. "
-                "Cached key may be invalid. Delete and recreate the agent."
-            )
     hook_log(
         "agent_register_result",
         {
-            "agent_name": agent_name,
-            "agent_id": agent_id,
             "agent_session_name": agent_session_name,
             "registered": registered,
             "connection_id": str(registration.get("id", "")),
             "session_id": session_id,
+            "user_id": user_id,
         },
     )
 
-    return agent_id, agent_api_key, agent_name, registered
+    return user_id, api_key, agent_session_name, registered
 
 
 def _watcher_alive() -> bool:
@@ -977,13 +689,18 @@ def _find_claude_parent_pid() -> int:
             continue
         table[pid] = (ppid, parts[2])
 
+    import re
+
+    # Match "claude" as an executable basename anywhere in the command line,
+    # tolerant of spaces in the executable path (a naive split()[0] mis-tokenizes
+    # paths like "/…/Application Support/…/claude").
+    host_re = re.compile(r"(?:^|/)claude(?:-[\w.]+)?(?:\s|$)")
     pid = fallback
     seen: set[int] = set()
     while pid > 1 and pid not in seen:
         seen.add(pid)
         ppid, command = table.get(pid, (0, ""))
-        executable = Path(command.split()[0]).name if command else ""
-        if executable == "claude" or executable.startswith("claude-"):
+        if command and host_re.search(command):
             return pid
         pid = ppid
     return fallback
@@ -1228,8 +945,8 @@ async def _run_heavy(
     agent_name = _resolve_agent_name(config, cwd)
     os.environ["COGNEE_AGENT_NAME"] = agent_name
 
-    # Preferred HTTP path: create/get named agent, use its API key,
-    # and register this session in agent-mode.
+    # HTTP path: resolve the single principal key (env / cache / mint from the
+    # default user) and register this session as an agent-mode connection.
     if is_cloud_mode(config):
         try:
             (
@@ -1284,6 +1001,14 @@ async def _run_heavy(
     if service_url and server_health_ok(service_url, timeout=1.5):
         mark_server_ready(service_url)
 
+    # Seed the status line's session count so "(+N more)" shows from the start.
+    try:
+        from _plugin_common import sessions_count_refresh
+
+        sessions_count_refresh(force=True)
+    except Exception as exc:
+        hook_log("sessions_count_seed_failed", {"error": str(exc)[:200]})
+
     return user_id, agent_api_key, True
 
 
@@ -1295,17 +1020,19 @@ async def _run_bootstrap(bootstrap: dict) -> None:
          so concurrent agents don't each spawn uvicorn. Workers that don't win
          the lock just wait for /health instead of returning.
       2. Register THIS agent/session — runs for EVERY agent, regardless of who
-         booted, because registration is per-agent (and concurrency-safe via
-         the agent-keys / agent-lifecycle locks inside _run_heavy).
+         booted, because registration is per-session (the connection handle is
+         the Cognee session id) under the single principal.
     """
     config = load_config()
     cwd = str(bootstrap.get("cwd") or os.getcwd())
     session_id = str(bootstrap.get("session_id", "") or "")
     session_key = str(bootstrap.get("session_key", "") or "")
     dataset = str(bootstrap.get("dataset", "") or get_dataset(config))
-    agent_session_name = str(bootstrap.get("agent_session_name", "") or session_key)
+    agent_session_name = str(bootstrap.get("agent_session_name", "") or session_id)
     if session_key:
         os.environ["COGNEE_SESSION_KEY"] = session_key
+    if session_id:
+        os.environ["COGNEE_SESSION_ID"] = session_id
     service_url = _with_scheme(bootstrap.get("service_url", "") or _LOCAL_SERVICE_URL)
     health_url = _health_url(service_url)
     config["service_url"] = service_url
@@ -1392,24 +1119,13 @@ async def _start(payload: dict | None = None) -> dict:
     if api_key:
         os.environ["COGNEE_API_KEY"] = api_key
 
-    session_id = get_session_id(config, cwd)
-    payload_session_id = (
-        str(payload.get("session_id", "") or "").strip() if isinstance(payload, dict) else ""
-    )
+    # The host (Claude) session id is a local correlation key only: it keeps every
+    # hook process of this launch resolving the SAME Cognee session id (via the
+    # host-keyed map). It is never sent to Cognee as an identity.
     session_candidate, session_source = resolve_session_key_from_payload(payload)
     session_key = set_session_key(session_candidate)
-    hook_log(
-        "session_key_resolved",
-        {
-            "source": session_source,
-            "session_key": session_key,
-            "payload_session_id_present": bool(payload_session_id),
-        },
-    )
     if not session_key:
-        hook_log(
-            "missing_payload_session_id", {"session_id": session_id, "cwd": cwd, "payload": payload}
-        )
+        hook_log("missing_payload_session_id", {"cwd": cwd, "payload": payload})
         print(
             "cognee-plugin: missing payload session_id; refusing to register",
             file=sys.stderr,
@@ -1420,8 +1136,30 @@ async def _start(payload: dict | None = None) -> dict:
                 "systemMessage": "Cognee Memory: session key missing in SessionStart payload.",
             }
         }
-    agent_session_name = session_key
     os.environ["COGNEE_SESSION_KEY"] = session_key
+
+    # Resolve (and persist) this launch's record: session_id (data scoping, new
+    # per launch, switchable by the picker) + conn_uuid (liveness handle for
+    # registration/counting, never switched). Written synchronously here so
+    # prompt hooks read back the identical ids before any of them run.
+    session_id, conn_uuid = ensure_launch_record(session_key, cwd)
+    os.environ["COGNEE_SESSION_ID"] = session_id
+    agent_session_name = conn_uuid
+    # Record host_pid -> host_key so the picker command can find this launch by
+    # walking the process tree (it has no session id in its env).
+    try:
+        write_launch_pid_map(_find_claude_parent_pid(), session_key)
+    except Exception as exc:
+        hook_log("launch_pid_map_write_failed", {"error": str(exc)[:200]})
+    hook_log(
+        "session_resolved",
+        {
+            "source": session_source,
+            "session_key": session_key,
+            "session_id": session_id,
+            "conn_uuid": conn_uuid,
+        },
+    )
     dataset = get_dataset(config)
 
     # Boot-vs-connect is decided purely by whether the server is already up:
@@ -1471,8 +1209,10 @@ async def _start(payload: dict | None = None) -> dict:
     # an immediate improve on startup.
     touch_activity()
 
-    # Launch the idle watcher. If COGNEE_IDLE_DISABLED is set, skip it.
-    if not config.get("service_url") and os.environ.get("COGNEE_IDLE_DISABLED", "").lower() not in (
+    # Launch the idle watcher (syncs session memory to graph after the agent
+    # goes idle). Runs in both local-server and cloud modes — the watcher picks
+    # the HTTP or local sync path itself. COGNEE_IDLE_DISABLED opts out.
+    if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() not in (
         "1",
         "true",
         "yes",

@@ -185,7 +185,7 @@ async def _run(prompt: str) -> dict | None:
         (["session"], None),
         (["trace"], None),
         (["graph_context"], None),
-        (["graph"], "GRAPH_COMPLETION"),
+        (["graph"], "HYBRID_COMPLETION"),
     ]
     if not cloud_mode:
         import cognee
@@ -214,7 +214,7 @@ async def _run(prompt: str) -> dict | None:
                     timeout=recall_timeout,
                 )
             else:
-                query_type = SearchType.GRAPH_COMPLETION if qtype == "GRAPH_COMPLETION" else None
+                query_type = getattr(SearchType, qtype, None) if qtype else None
                 part = await asyncio.wait_for(
                     cognee.recall(
                         prompt,
@@ -242,7 +242,7 @@ async def _run(prompt: str) -> dict | None:
         if not isinstance(r, dict):
             continue
         src = r.get("source", "session")
-        # Fold scope=graph (GRAPH_COMPLETION) results into the graph_context
+        # Fold scope=graph (HYBRID_COMPLETION) results into the graph_context
         # bucket so the displayed `g` counter reflects what was retrieved.
         if src == "graph":
             r["source"] = "graph_context"
