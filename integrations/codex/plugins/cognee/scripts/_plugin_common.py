@@ -137,7 +137,9 @@ def _generate_session_id(cwd: str = "") -> str:
     the random token guarantees a new session per launch. No host/Codex session
     id is embedded — the host id is only a local correlation key (see below).
     """
-    prefix = _sanitize_session_key(os.environ.get("COGNEE_SESSION_PREFIX", "") or "cc") or "cc"
+    prefix = (
+        _sanitize_session_key(os.environ.get("COGNEE_SESSION_PREFIX", "") or "codex") or "codex"
+    )
     cwd = cwd or os.environ.get("CODEX_CWD") or os.getcwd()
     dir_name = _sanitize_session_key(Path(cwd).name) or "session"
     return f"{prefix}_{dir_name}_{uuid.uuid4().hex[:12]}"

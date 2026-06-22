@@ -28,7 +28,7 @@ _BRIDGE_STATE_FILE = _STATE_DIR / "bridge_state.json"
 _HOOK_LOG = _STATE_DIR / "hook.log"
 
 _DEFAULTS = {
-    "dataset": "codex_sessions",
+    "dataset": "cognee_sessions",
     "agent_name": "codex-agent",
     "session_strategy": "per-directory",  # per-directory | git-branch | static
     "session_prefix": "codex",
@@ -153,7 +153,7 @@ def get_session_id(config: dict, cwd: Optional[str] = None) -> str:
 
 def get_dataset(config: dict) -> str:
     """Get the dataset name from config."""
-    return config.get("dataset", "codex_sessions")
+    return config.get("dataset", "cognee_sessions")
 
 
 def is_cloud_mode(config: dict) -> bool:
