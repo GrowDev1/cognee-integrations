@@ -94,7 +94,7 @@ _UV_BIN = _UV_DIR / ("uv.exe" if os.name == "nt" else "uv")
 _UV_PYTHON_DIR = _GLOBAL_STATE_DIR / "python"
 _UV_INSTALL_URL = "https://astral.sh/uv/install.sh"
 _PINNED_PYTHON = os.environ.get("COGNEE_PLUGIN_PYTHON", "") or "3.12"
-_PINNED_COGNEE = "cognee==1.2.1"
+_PINNED_COGNEE_VERSION = "1.2.1"
 _INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
 
 # Install single-flight. Distinct from the server boot lock (which is short, on
@@ -178,7 +178,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
 
     Called from the server-boot critical section (so it is already
     single-flighted) and only at boot points — i.e. when no healthy server is
-    serving. Always installs the exact pinned version (_PINNED_COGNEE) so the
+    serving. Always installs the exact pinned version (_PINNED_COGNEE_VERSION) so the
     server's FastAPI lifespan migrations run on a known-good release.
 
     Fails soft: if the install can't run (e.g. offline) but a usable cognee is
@@ -227,7 +227,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
             except FileExistsError:
                 # Another process owns the install. Don't install concurrently —
                 # wait for it to produce a usable venv, then reuse it.
-                if _venv_cognee_version() == "1.2.1":
+                if _venv_cognee_version() == _PINNED_COGNEE_VERSION:
                     return True
                 if time.monotonic() >= deadline:
                     return bool(_venv_cognee_version())
@@ -257,7 +257,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                         "--upgrade",
                         "--python",
                         str(_VENV_PYTHON),
-                        _PINNED_COGNEE,
+                        f"cognee=={_PINNED_COGNEE_VERSION}",
                     ],
                     env=env,
                     check=True,
@@ -279,7 +279,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                     timeout=timeout,
                 )
                 subprocess.run(
-                    [str(_VENV_PYTHON), "-m", "pip", "install", "--upgrade", _PINNED_COGNEE],
+                    [str(_VENV_PYTHON), "-m", "pip", "install", "--upgrade", f"cognee=={_PINNED_COGNEE_VERSION}"],
                     check=True,
                     capture_output=True,
                     text=True,
