@@ -86,7 +86,7 @@ if service_url and api_key:
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
         pass
 
-print(json.dumps({"session_id": session_id, "dataset": dataset}))
+print(json.dumps({"session_id": session_id, "dataset": dataset, "service_url": service_url, "api_key": api_key}))
 PY
 )"
 
@@ -106,8 +106,26 @@ except Exception:
     pass
 PY
 )"
+SERVICE_URL="$(python3 - <<'PY' "${runtime_json}" 2>/dev/null || true
+import json, sys
+try:
+    print((json.loads(sys.argv[1] or "{}").get("service_url") or "").strip())
+except Exception:
+    pass
+PY
+)"
+API_KEY="$(python3 - <<'PY' "${runtime_json}" 2>/dev/null || true
+import json, sys
+try:
+    print((json.loads(sys.argv[1] or "{}").get("api_key") or "").strip())
+except Exception:
+    pass
+PY
+)"
 [ -z "$DATASET" ] && DATASET="${COGNEE_PLUGIN_DATASET:-claude_sessions}"
 [ -z "$SESSION_ID" ] && SESSION_ID="${COGNEE_SESSION_ID:-claude_session}"
+[ -z "$SERVICE_URL" ] && SERVICE_URL="${COGNEE_BASE_URL:-${COGNEE_LOCAL_API_URL:-http://localhost:8011}}"
+[ -z "$API_KEY" ] && API_KEY="${COGNEE_API_KEY:-}"
 
 QUERY="${1:-}"
 TOP_K="${2:-5}"
@@ -126,16 +144,39 @@ if [ -z "$QUERY" ]; then
     exit 1
 fi
 
-if [ "$MODE" = "graph" ]; then
-    cognee-cli recall "$QUERY" -d "$DATASET" -k "$TOP_K" -f json 2>/dev/null
-elif [ "$MODE" = "session" ]; then
-    cognee-cli recall "$QUERY" -s "$SESSION_ID" -k "$TOP_K" -f json 2>/dev/null
+# Search scope from MODE
+case "$MODE" in
+    session) SCOPE='["session"]' ;;
+    graph)   SCOPE='["graph"]' ;;
+    *)       SCOPE='["session", "graph"]' ;;
+esac
+
+# Server-first: the running server (/api/v1/recall) is the source of truth.
+# Only a 2xx response is authoritative (an empty list = genuinely no hits).
+# Any non-2xx / error / unreachable returns the UNREACHABLE sentinel so we fall
+# back to cognee-cli and warn — never reporting a server failure as "not found".
+# `datasets` is intentionally NOT sent: the server scopes to the caller's
+# read-authorized datasets, so search spans them all (restricting to the plugin
+# default is what produced false "not found" when content lived elsewhere).
+# Logic lives in _recall_http.py (stdlib-only, unit-tested); stderr is surfaced.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"
+RECALL_JSON="$(python3 "${SELF_DIR}/_recall_http.py" "$SERVICE_URL" "$API_KEY" "$QUERY" "$SESSION_ID" "$SCOPE" "$TOP_K" || true)"
+
+if [ -n "$RECALL_JSON" ] && [ "$RECALL_JSON" != "UNREACHABLE" ]; then
+    # Server answered — authoritative, even if the result is empty.
+    printf '%s\n' "$RECALL_JSON"
 else
-    # Auto: try session first, fall back to graph
-    RESULT=$(cognee-cli recall "$QUERY" -s "$SESSION_ID" -k "$TOP_K" -f json 2>/dev/null)
-    if [ -n "$RESULT" ] && [ "$RESULT" != "[]" ]; then
-        echo "$RESULT"
+    echo "[cognee-search] falling back to cognee-cli (degraded — empty CLI output is NOT proof of absence; ground-truth via: curl -X POST \"\$COGNEE_BASE_URL/api/v1/recall\")" >&2
+    if [ "$MODE" = "graph" ]; then
+        cognee-cli recall "$QUERY" -d "$DATASET" -k "$TOP_K" -f json 2>/dev/null || true
+    elif [ "$MODE" = "session" ]; then
+        cognee-cli recall "$QUERY" -s "$SESSION_ID" -k "$TOP_K" -f json 2>/dev/null || true
     else
-        cognee-cli recall "$QUERY" -d "$DATASET" -k "$TOP_K" -f json 2>/dev/null
+        RESULT=$(cognee-cli recall "$QUERY" -s "$SESSION_ID" -k "$TOP_K" -f json 2>/dev/null || true)
+        if [ -n "$RESULT" ] && [ "$RESULT" != "[]" ]; then
+            echo "$RESULT"
+        else
+            cognee-cli recall "$QUERY" -d "$DATASET" -k "$TOP_K" -f json 2>/dev/null || true
+        fi
     fi
 fi

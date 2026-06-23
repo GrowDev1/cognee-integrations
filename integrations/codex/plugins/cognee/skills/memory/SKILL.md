@@ -58,6 +58,19 @@ uv run cognee-cli search "<code question>" -d <dataset-name> -t CODE -k 10 -f pr
 
 Use `-f json` when downstream parsing is needed.
 
+### The server is the source of truth
+
+`cognee-cli` is a thin client over the running Cognee server and can print **empty stdout even when content exists** (a serialization quirk). So:
+- **Never conclude "not found" from an empty/clean CLI run.** Confirm against the server directly — this is authoritative:
+  ```bash
+  curl -s -X POST "${COGNEE_BASE_URL:-http://localhost:8011}/api/v1/recall" \
+    -H "Content-Type: application/json" \
+    -H "X-Api-Key: ${COGNEE_API_KEY:-}" \
+    -d '{"query": "<question>", "top_k": 5, "only_context": true, "scope": ["graph"]}'
+  ```
+- **Do not re-run the same CLI search to "retry."** One server answer is authoritative.
+- Omit `-d <dataset>` to search **all** your datasets; restricting to one dataset can miss content that lives in another.
+
 ## Improve Memory
 
 Enrich an existing graph:

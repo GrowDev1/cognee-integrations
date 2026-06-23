@@ -25,35 +25,38 @@ Cognee organizes knowledge into three categories:
 
 ## Search commands
 
-**More session context:**
+Always search via the wrapper — it queries the **running server first** (`/api/v1/recall`, the source of truth), searches **all authorized datasets** (so a hit isn't missed because it's in another dataset), and falls back to `cognee-cli` only if the server is unreachable.
+
+**Session context:**
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh "<query>" 10 --session
 ```
 
-**Permanent graph (all categories):**
+**Permanent graph:**
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh "<query>" 10 --graph
 ```
 
-**Permanent graph (specific category):**
+**Ground-truth (if a result is empty but you expect content) — authoritative:**
 ```bash
-cognee-cli recall "<query>" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set user_context -k 10 -f json
-cognee-cli recall "<query>" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set project_docs -k 10 -f json
-cognee-cli recall "<query>" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set agent_actions -k 10 -f json
+curl -s -X POST "${COGNEE_BASE_URL:-http://localhost:8011}/api/v1/recall" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: ${COGNEE_API_KEY:-}" \
+  -d '{"query": "<query>", "top_k": 10, "only_context": true, "scope": ["graph"]}'
 ```
 
-## Routing
+Category filtering uses `node_name` on the same call (the CLI doesn't expose it): add `"node_name": ["project_docs"]` (or `user_context` / `agent_actions`).
 
-Determine which category to search based on the query:
-- "my preferences" / "how I like" / "what I told you" → `user_context`
-- "the codebase" / "architecture" / "project docs" → `project_docs`
-- "what we did" / "previous actions" / "tool results" → `agent_actions`
-- General or unclear → search all (no `--node-set` filter)
+## The server is the source of truth (read this before reporting "not found")
+
+- **An empty result is only valid if it came from the server.** `cognee-cli` is a thin client over the same server and can print empty stdout even when content exists. **Never conclude "not found" from an empty/clean CLI run** — confirm with the `curl` above first.
+- **Do not re-run the same search to "retry."** One server answer is authoritative — report it and stop. (Re-running the CLI and chasing async warnings is how a confident-but-wrong "nothing found" verdict gets produced.)
+- **If the output is an `{"error": ...}` object instead of a list**, the server was reachable but rejected/failed the request (e.g. auth) — report that error and check `COGNEE_API_KEY`. It is **not** "no results", and the wrapper deliberately does **not** fall back to the local CLI in that case.
 
 ## Output
 
-Parse the JSON results. Results with `"_source": "session"` came from the current session; `"_source": "graph"` came from the permanent knowledge graph. Return a concise summary organized by relevance, indicating the source and category.
+Parse the JSON results (`"_source": "session"` = current session; `"_source": "graph"` = permanent graph). Return a concise summary by relevance, noting the source.
 
-If no results are found, suggest:
+If the **server** genuinely returns nothing, then suggest:
 - `/cognee-memory:cognee-sync` to sync session data to the permanent graph
 - `/cognee-memory:cognee-remember` to ingest new data
