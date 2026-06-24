@@ -13,6 +13,7 @@ Run: `pytest integrations/claude-code/tests/test_recall_http.py`
 (or `python integrations/claude-code/tests/test_recall_http.py` standalone).
 """
 
+import json
 import pathlib
 import sys
 import urllib.error
@@ -129,6 +130,28 @@ def test_no_cloud_key_sent_to_localhost():
         "https://tenant.cognee.ai", "cloud-key", "q", "", '["graph"]', "5", opener=_capture
     )
     assert captured["xapikey"] == "cloud-key"
+
+
+def test_dataset_scoped_in_body():
+    captured = {}
+
+    def _capture(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp("[]")
+
+    rh.do_recall("http://x", "", "q", "", '["graph"]', "5", "my_dataset", opener=_capture)
+    assert captured["body"].get("datasets") == ["my_dataset"]
+
+
+def test_no_dataset_key_when_empty():
+    captured = {}
+
+    def _capture(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp("[]")
+
+    rh.do_recall("http://x", "", "q", "", '["graph"]', "5", "", opener=_capture)
+    assert "datasets" not in captured["body"]
 
 
 def test_coerce_top_k():

@@ -137,12 +137,11 @@ esac
 # Only a 2xx response is authoritative (an empty list = genuinely no hits).
 # Any non-2xx / error / unreachable returns the UNREACHABLE sentinel so we fall
 # back to cognee-cli and warn — never reporting a server failure as "not found".
-# `datasets` is intentionally NOT sent: the server scopes to the caller's
-# read-authorized datasets, so search spans them all (restricting to the plugin
-# default is what produced false "not found" when content lived elsewhere).
+# $DATASET is resolved above (connections/me → COGNEE_PLUGIN_DATASET → default)
+# and scopes the search to the plugin's dataset so unrelated datasets don't bleed in.
 # Logic lives in _recall_http.py (stdlib-only, unit-tested); stderr is surfaced.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"
-RECALL_JSON="$(python3 "${SELF_DIR}/_recall_http.py" "$SERVICE_URL" "$API_KEY" "$QUERY" "$SESSION_ID" "$SCOPE" "$TOP_K" || true)"
+RECALL_JSON="$(python3 "${SELF_DIR}/_recall_http.py" "$SERVICE_URL" "$API_KEY" "$QUERY" "$SESSION_ID" "$SCOPE" "$TOP_K" "$DATASET" || true)"
 
 if [ -n "$RECALL_JSON" ] && [ "$RECALL_JSON" != "UNREACHABLE" ]; then
     # Server answered — authoritative, even if the result is empty.
