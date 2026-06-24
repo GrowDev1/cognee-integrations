@@ -209,6 +209,19 @@ async def _run(prompt: str) -> dict | None:
     # whole loop stops once the overall budget is spent. Partial results are fine.
     recall_timeout = _float_env("COGNEE_RECALL_TIMEOUT", 2.5)
     budget_deadline = time.monotonic() + _float_env("COGNEE_RECALL_BUDGET", 4.0)
+    # Respect the shared circuit breaker: when the server has been failing (tripped
+    # by the explicit recall path), skip this per-prompt recall rather than hammering
+    # a down backend on every keystroke. HTTP/cloud mode only.
+    if cloud_mode:
+        try:
+            from _cognee_client import breaker_open
+
+            _bopen, _bretry = breaker_open()
+        except Exception:
+            _bopen, _bretry = False, 0
+        if _bopen:
+            hook_log("recall_breaker_open", {"retry_in": _bretry})
+            scope_specs = []
     for scope_list, qtype in scope_specs:
         if time.monotonic() >= budget_deadline:
             hook_log("recall_budget_exceeded", {"collected": len(results)})

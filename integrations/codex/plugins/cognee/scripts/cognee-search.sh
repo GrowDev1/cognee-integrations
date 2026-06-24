@@ -140,9 +140,11 @@ esac
 # `datasets` is intentionally NOT sent: the server scopes to the caller's
 # read-authorized datasets, so search spans them all (restricting to the plugin
 # default is what produced false "not found" when content lived elsewhere).
-# Logic lives in _recall_http.py (stdlib-only, unit-tested); stderr is surfaced.
+# Logic lives in _cognee_client.py (stdlib-only, unit-tested): server-first recall
+# wrapped by a shared file-based circuit breaker + a bounded timeout. stderr surfaced.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"
-RECALL_JSON="$(python3 "${SELF_DIR}/_recall_http.py" "$SERVICE_URL" "$API_KEY" "$QUERY" "$SESSION_ID" "$SCOPE" "$TOP_K" || true)"
+export COGNEE_PLUGIN_STATE_DIR="$PLUGIN_DIR"
+RECALL_JSON="$(python3 "${SELF_DIR}/_cognee_client.py" "$SERVICE_URL" "$API_KEY" "$QUERY" "$SESSION_ID" "$SCOPE" "$TOP_K" || true)"
 
 if [ -n "$RECALL_JSON" ] && [ "$RECALL_JSON" != "UNREACHABLE" ]; then
     # Server answered — authoritative, even if the result is empty.
