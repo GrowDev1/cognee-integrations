@@ -70,6 +70,7 @@ def do_recall(
     session_id,
     scope,
     top_k,
+    dataset="",
     *,
     opener=urllib.request.urlopen,
     timeout=20.0,
@@ -84,12 +85,16 @@ def do_recall(
     }
     if session_id:
         body["session_id"] = session_id
-    # `datasets` is intentionally omitted. With no datasets, the server scopes the
-    # search to the caller's *read-authorized* datasets server-side (recall.py:
-    # get_specific_user_permission_datasets / get_authorized_existing_datasets, behind
-    # get_authenticated_user) — so it spans ALL authorized datasets with no cross-tenant
-    # leak. Restricting to one dataset client-side would reintroduce the false-negative
-    # where content lives in a different dataset than the plugin's default.
+    # Scope the search to the caller's plugin dataset (resolved by the shell from
+    # connections/me → COGNEE_PLUGIN_DATASET → default). All plugin writes target
+    # that single dataset, so searching elsewhere only adds noise from unrelated
+    # sessions or SDK calls (e.g. client.py defaulting to 'default_dataset').
+    # Server-side RBAC is still enforced: the named dataset must be owned by the
+    # authenticated user or the server returns DatasetNotFoundError.
+    # When dataset is empty (standalone invocation without shell), fall back to
+    # the original search-all behaviour to avoid breaking direct callers.
+    if dataset:
+        body["datasets"] = [dataset]
     headers = {"Content-Type": "application/json"}
     # COGNEE_API_KEY is a *cloud* credential; the local single-user server needs no
     # auth and ignores it. Only attach it for a remote/cloud target, so we don't send
@@ -137,9 +142,9 @@ def do_recall(
 
 
 def main(argv):
-    # argv: service_url, api_key, query, session_id, scope, top_k
-    a = list(argv) + [""] * 6
-    result = do_recall(a[0], a[1], a[2], a[3], a[4], a[5])
+    # argv: service_url, api_key, query, session_id, scope, top_k[, dataset]
+    a = list(argv) + [""] * 7
+    result = do_recall(a[0], a[1], a[2], a[3], a[4], a[5], a[6])
     # UNREACHABLE → caller falls back to CLI; a list (results) or an error
     # object → caller prints as-is and does NOT fall back.
     print(UNREACHABLE if result == UNREACHABLE else json.dumps(result))

@@ -100,6 +100,19 @@ def test_record_success_clears():
     assert cc.breaker_open()[0] is False
 
 
+def test_dataset_forwarded_to_transport():
+    _reset()
+    captured = {}
+
+    def _capture(*a, **k):
+        captured["dataset"] = a[6] if len(a) > 6 else k.get("dataset", "")
+        return []
+
+    cc.do_recall = _capture
+    cc.recall("http://x", "", "q", "", '["graph"]', "5", "my_dataset")
+    assert captured.get("dataset") == "my_dataset"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
