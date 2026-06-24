@@ -1110,7 +1110,6 @@ async def _start(payload: dict | None = None) -> dict:
             file=sys.stderr,
         )
         return {
-            "systemMessage": "Cognee Memory: session key missing in SessionStart payload.",
             "hookSpecificOutput": {"hookEventName": "SessionStart"},
         }
     os.environ["COGNEE_SESSION_KEY"] = session_key
@@ -1207,7 +1206,6 @@ async def _start(payload: dict | None = None) -> dict:
 
     status_line = render_status_for_host(session_key)
     return {
-        "systemMessage": f"Cognee Memory Connected\n{status_line}",
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": status_line,

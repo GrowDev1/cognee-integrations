@@ -242,7 +242,7 @@ def main():
         sys.exit(1)
 
     session_id = bootstrap.get("session_id", "")
-    dataset = bootstrap.get("dataset", "claude_sessions")
+    dataset = bootstrap.get("dataset", "agent_sessions")
     user_id = bootstrap.get("user_id", "")
     session_key = str(bootstrap.get("session_key", "") or "").strip()
     try:

@@ -45,7 +45,7 @@ The wrapper POSTs to the running Cognee server (`/api/v1/remember`). A `{"ok": t
 `cognee-cli` is a thin client over the same server. Use it only when the server is genuinely down:
 
 ```bash
-cognee-cli remember "$ARGUMENTS" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set user_context
+cognee-cli remember "$ARGUMENTS" -d "${COGNEE_PLUGIN_DATASET:-agent_sessions}" --node-set user_context
 ```
 
 **Empty or clean CLI output does NOT confirm the data was stored.** Verify via the server directly once it is back up.

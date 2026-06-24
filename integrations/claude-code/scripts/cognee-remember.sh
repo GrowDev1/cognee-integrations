@@ -98,7 +98,7 @@ PY
 
 [ -z "$SERVICE_URL" ] && SERVICE_URL="${COGNEE_BASE_URL:-${COGNEE_LOCAL_API_URL:-http://localhost:8011}}"
 [ -z "$API_KEY" ] && API_KEY="${COGNEE_API_KEY:-}"
-[ -z "$DATASET" ] && DATASET="${COGNEE_PLUGIN_DATASET:-claude_sessions}"
+[ -z "$DATASET" ] && DATASET="${COGNEE_PLUGIN_DATASET:-agent_sessions}"
 
 # Parse arguments: content is first positional; flags follow
 CONTENT="${1:-}"

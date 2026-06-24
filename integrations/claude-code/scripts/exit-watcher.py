@@ -110,7 +110,7 @@ def main() -> None:
 
     parent_pid = int(bootstrap.get("parent_pid") or 0)
     session_id = str(bootstrap.get("session_id") or "")
-    dataset = str(bootstrap.get("dataset") or "claude_sessions")
+    dataset = str(bootstrap.get("dataset") or "agent_sessions")
     session_key = str(bootstrap.get("session_key") or "")
     agent_session_name = str(bootstrap.get("agent_session_name") or "")
     api_key = str(bootstrap.get("api_key") or "")

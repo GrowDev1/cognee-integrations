@@ -104,7 +104,7 @@ except Exception:
     pass
 PY
 )"
-[ -z "$DATASET" ] && DATASET="${COGNEE_PLUGIN_DATASET:-codex_sessions}"
+[ -z "$DATASET" ] && DATASET="${COGNEE_PLUGIN_DATASET:-agent_sessions}"
 [ -z "$SESSION_ID" ] && SESSION_ID="${COGNEE_SESSION_ID:-codex_session}"
 [ -z "$SERVICE_URL" ] && SERVICE_URL="${COGNEE_BASE_URL:-${COGNEE_LOCAL_API_URL:-http://localhost:8011}}"
 [ -z "$API_KEY" ] && API_KEY="${COGNEE_API_KEY:-}"

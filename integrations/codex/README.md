@@ -9,7 +9,15 @@ The integration:
 
 ## Install
 
-Install via the Codex marketplace:
+Install via the Codex marketplace. First enable hooks, then run the install commands in your terminal or directly inside a Codex session.
+
+You can enable hooks with:
+
+```bash
+codex features enable hooks
+```
+
+Or set it manually in your Codex config:
 
 ```toml
 # ~/.codex/config.toml
@@ -42,11 +50,11 @@ You can also set config in `~/.cognee-plugin/config.json`:
 ```json
 {
   "base_url": "https://your-instance.cognee.ai",
-  "dataset": "cognee_sessions"
+  "dataset": "agent_sessions"
 }
 ```
 
-On startup you should see a "Cognee Memory Connected" system message.
+On startup the statusline shows `cognee: <dataset> · local` (or `· cloud`) to confirm the plugin is active.
 
 ## Auth
 
@@ -66,7 +74,8 @@ At startup (`SessionStart`):
 At hook runtime:
 - hooks resolve mode through runtime endpoint auth (env + `api_key.json`), not only config intent
 - `http` mode skips local SDK initialization
-- `local_sdk` mode runs `ensure_cognee_ready(...)`
+
+The hooks emit `mode_decision` logs with `mode`, `service_url`, `url_source`, `key_source`, `api_key_present`.
 
 ## Sessions
 
@@ -91,7 +100,7 @@ Two terminals can deliberately share a session by setting the same `COGNEE_SESSI
 
 ## Dataset
 
-All session data is written to a single dataset. By default both the Claude Code and Codex plugins write to the same dataset (`cognee_sessions`), so memory is shared across both integrations.
+All writes and recall are scoped to a single dataset. By default both the Claude Code and Codex plugins use `agent_sessions`, so memory is shared across both integrations automatically.
 
 Set a custom dataset at launch:
 
@@ -106,7 +115,9 @@ Or persist it in `~/.cognee-plugin/config.json`:
 { "dataset": "my-project-memory" }
 ```
 
-The dataset is fixed for the lifetime of a launch — it cannot be changed mid-session.
+The dataset is fixed for the lifetime of a launch. Recall searches only the active dataset. If you want to
+change the active dataset, you have to exit Claude, change the dataset via env, and then start Claude again.
+Data added outside of Claude to the dataset (via SDK or the server for example) is visible in Claude via the Cognee plugin.
 
 ## Hooks
 
@@ -119,16 +130,33 @@ The dataset is fixed for the lifetime of a launch — it cannot be changed mid-s
 | `PreCompact` | memory anchor build before compaction |
 | `SessionEnd` | trigger detached final sync worker |
 
+## Session sync and watchers
+
+An idle watcher runs in the background for the lifetime of each launch. It polls activity every `COGNEE_IDLE_POLL` seconds and persists the session cache when the session has been quiet for `COGNEE_IDLE_THRESHOLD` seconds, then waits at least `COGNEE_IMPROVE_COOLDOWN` seconds before the next run.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `COGNEE_IDLE_POLL` | `10` | Poll interval in seconds |
+| `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle sync fires |
+| `COGNEE_IMPROVE_COOLDOWN` | `120` | Minimum seconds between idle sync runs |
+
+Final sync on session end is triggered by the `SessionEnd` detached worker, with an exit watcher as fallback if the process exits without firing `SessionEnd`.
+
 ## Status visibility
 
-Cognee dataset status is shown as:
+Cognee status is shown as `cognee: <dataset> · <mode>`, for example:
 
-`cognee: <dataset-name>`
+```
+cognee: agent_sessions · local
+cognee: my-project · cloud
+```
 
-It is rendered by the Cognee statusline renderer using the same resolution order as the hooks:
-1. `COGNEE_PLUGIN_DATASET` env var
-2. `~/.cognee-plugin/config.json` → `dataset` key
-3. Default: `cognee_sessions`
+`<dataset>` is the active Cognee dataset. `<mode>` is `local` when no `COGNEE_BASE_URL` is set or when it points to localhost, and `cloud` when it points to a remote host.
+
+The renderer reads only local state — no network calls on every refresh:
+1. `COGNEE_PLUGIN_DATASET` / `COGNEE_BASE_URL` env vars
+2. `~/.cognee-plugin/config.json` → `dataset` and `base_url` keys
+3. Default: `cognee: agent_sessions · local`
 
 ## Logs and state
 
@@ -173,7 +201,7 @@ Config precedence:
 
 | Key | Env var(s) | Default | Notes |
 |---|---|---|---|
-| `dataset` | `COGNEE_PLUGIN_DATASET` | `cognee_sessions` | Dataset name |
+| `dataset` | `COGNEE_PLUGIN_DATASET` | `agent_sessions` | Dataset for writes and recall |
 | `session_id` | `COGNEE_SESSION_ID` | auto-generated per launch | Override to resume a named session |
 | `session_strategy` | `COGNEE_SESSION_STRATEGY` | `per-directory` | `per-directory`, `git-branch`, `static` |
 | `session_prefix` | `COGNEE_SESSION_PREFIX` | `codex` | Prefix for auto-generated session IDs |
@@ -181,8 +209,16 @@ Config precedence:
 | `api_key` | `COGNEE_API_KEY` | unset | API key; auto-minted if absent in local mode |
 | local URL override | `COGNEE_LOCAL_API_URL` | `http://localhost:8011` | Local API base URL |
 | local LLM | `LLM_API_KEY`, `LLM_MODEL` | unset | Required for local mode runtime |
+| idle watcher poll | `COGNEE_IDLE_POLL` | `10` | Idle watcher poll interval in seconds |
+| idle watcher threshold | `COGNEE_IDLE_THRESHOLD` | `60` | Seconds of inactivity before idle sync fires |
+| idle watcher cooldown | `COGNEE_IMPROVE_COOLDOWN` | `120` | Minimum seconds between idle sync runs |
 
 ## Troubleshooting
+
+**Recall returns empty but data was ingested**
+- Recall is scoped to the active dataset (`COGNEE_PLUGIN_DATASET` / `config.json` / `agent_sessions`).
+- Data written via the Python SDK or `client.py` goes to `default_dataset` by default, if dataset not otherwise specified.
+- To verify, call the recall API directly without a dataset filter: `curl -X POST "$COGNEE_BASE_URL/api/v1/recall" -d '{"query":"..."}'`
 
 **SessionStart hook invalid JSON output**
 - Check `hook.log` and confirm the installed plugin version matches the expected hook contract.
