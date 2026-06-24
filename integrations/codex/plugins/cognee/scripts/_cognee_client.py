@@ -75,7 +75,7 @@ def record_success():
     _write({"failures": 0, "cooldown_until": 0.0})
 
 
-def recall(service_url, api_key, query, session_id, scope, top_k, *, timeout=None):
+def recall(service_url, api_key, query, session_id, scope, top_k, dataset="", *, timeout=None):
     """Breaker-wrapped recall. Returns a list, an error-envelope dict, or UNREACHABLE.
 
     Only genuine backend trouble trips the breaker: UNREACHABLE (connection
@@ -96,6 +96,7 @@ def recall(service_url, api_key, query, session_id, scope, top_k, *, timeout=Non
         session_id,
         scope,
         top_k,
+        dataset,
         timeout=timeout or _RECALL_TIMEOUT,
     )
     if result == UNREACHABLE:
@@ -108,9 +109,9 @@ def recall(service_url, api_key, query, session_id, scope, top_k, *, timeout=Non
 
 
 def main(argv):
-    # argv: service_url, api_key, query, session_id, scope, top_k
-    a = list(argv) + [""] * 6
-    result = recall(a[0], a[1], a[2], a[3], a[4], a[5])
+    # argv: service_url, api_key, query, session_id, scope, top_k[, dataset]
+    a = list(argv) + [""] * 7
+    result = recall(a[0], a[1], a[2], a[3], a[4], a[5], a[6])
     print(UNREACHABLE if result == UNREACHABLE else json.dumps(result))
 
 

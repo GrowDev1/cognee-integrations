@@ -85,6 +85,14 @@ def do_recall(
     }
     if session_id:
         body["session_id"] = session_id
+    # Scope the search to the caller's plugin dataset (resolved by the shell from
+    # connections/me → COGNEE_PLUGIN_DATASET → default). All plugin writes target
+    # that single dataset, so searching elsewhere only adds noise from unrelated
+    # sessions or SDK calls (e.g. client.py defaulting to 'default_dataset').
+    # Server-side RBAC is still enforced: the named dataset must be owned by the
+    # authenticated user or the server returns DatasetNotFoundError.
+    # When dataset is empty (standalone invocation without shell), fall back to
+    # the original search-all behaviour to avoid breaking direct callers.
     if dataset:
         body["datasets"] = [dataset]
     headers = {"Content-Type": "application/json"}
