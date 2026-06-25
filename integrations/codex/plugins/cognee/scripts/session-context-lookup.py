@@ -258,7 +258,12 @@ async def _run(prompt: str) -> dict | None:
     # Bucket results by _source for human-readable output.
     # Local SDK mode returns Pydantic models (ResponseQAEntry, etc.); cloud
     # mode returns plain dicts via HTTP. Normalize to dicts here.
-    by_source: dict[str, list] = {"session": [], "trace": [], "graph_context": [], "session_context": []}
+    by_source: dict[str, list] = {
+        "session": [],
+        "trace": [],
+        "graph_context": [],
+        "session_context": [],
+    }
     for r in results or []:
         if hasattr(r, "model_dump"):
             r = r.model_dump()
