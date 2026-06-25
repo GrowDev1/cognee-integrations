@@ -82,13 +82,15 @@ def apply_cognee_env() -> None:
 
     Uses setdefault so an explicit user/env override always wins. Called on
     import so any process that spawns the cognee server (via os.environ.copy())
-    inherits a stable, upgrade-safe data location. CACHING is already cognee's
-    default but is set explicitly so a future default change can't disable it.
+    inherits a stable, upgrade-safe data location. CACHING and AUTO_FEEDBACK are
+    already cognee's defaults but are set explicitly so a future default change
+    can't silently disable session-context distillation.
     """
     os.environ.setdefault("SYSTEM_ROOT_DIRECTORY", str(_COGNEE_SYSTEM_DIR))
     os.environ.setdefault("DATA_ROOT_DIRECTORY", str(_COGNEE_DATA_DIR))
     os.environ.setdefault("CACHE_ROOT_DIRECTORY", str(_COGNEE_CACHE_DIR))
     os.environ.setdefault("CACHING", "true")
+    os.environ.setdefault("AUTO_FEEDBACK", "true")
 
 
 apply_cognee_env()
@@ -1114,6 +1116,7 @@ def recall_via_http(
     scope: list[str],
     only_context: bool = True,
     search_type: str | None = None,
+    context_profile: str | None = None,
     timeout: float = 10.0,
 ) -> list:
     payload = {
@@ -1125,6 +1128,8 @@ def recall_via_http(
     }
     if search_type:
         payload["search_type"] = search_type
+    if context_profile:
+        payload["context_profile"] = context_profile
     result = _json_http_request("/api/v1/recall", payload, timeout=timeout)
     return result if isinstance(result, list) else []
 

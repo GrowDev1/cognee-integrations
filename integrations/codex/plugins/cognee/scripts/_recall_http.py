@@ -71,6 +71,7 @@ def do_recall(
     scope,
     top_k,
     dataset="",
+    context_profile="",
     *,
     opener=urllib.request.urlopen,
     timeout=20.0,
@@ -95,6 +96,8 @@ def do_recall(
     # the original search-all behaviour to avoid breaking direct callers.
     if dataset:
         body["datasets"] = [dataset]
+    if context_profile:
+        body["context_profile"] = context_profile
     headers = {"Content-Type": "application/json"}
     # COGNEE_API_KEY is a *cloud* credential; the local single-user server needs no
     # auth and ignores it. Only attach it for a remote/cloud target, so we don't send
@@ -142,9 +145,9 @@ def do_recall(
 
 
 def main(argv):
-    # argv: service_url, api_key, query, session_id, scope, top_k[, dataset]
-    a = list(argv) + [""] * 7
-    result = do_recall(a[0], a[1], a[2], a[3], a[4], a[5], a[6])
+    # argv: service_url, api_key, query, session_id, scope, top_k[, dataset[, context_profile]]
+    a = list(argv) + [""] * 8
+    result = do_recall(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
     # UNREACHABLE → caller falls back to CLI; a list (results) or an error
     # object → caller prints as-is and does NOT fall back.
     print(UNREACHABLE if result == UNREACHABLE else json.dumps(result))

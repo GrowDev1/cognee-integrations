@@ -75,6 +75,10 @@ def _format_entry(entry: dict) -> str:
         content = str(entry.get("content", "") or entry.get("text", ""))[:TRUNCATE_GRAPH_CTX]
         return f"[graph-snapshot]\n{content}"
 
+    if source == "session_context":
+        content = str(entry.get("content", "") or entry.get("text", ""))[:TRUNCATE_GRAPH_CTX]
+        return f"[agent-guidance]\n{content}"
+
     if source == "trace":
         origin = entry.get("origin_function", "?")
         status = entry.get("status", "")
@@ -107,6 +111,8 @@ def _has_entry_content(entry: dict) -> bool:
     """Return True when a recall entry has useful content to inject."""
     source = entry.get("source", "")
     if source == "graph_context":
+        return bool(str(entry.get("content", "") or entry.get("text", "")).strip())
+    if source == "session_context":
         return bool(str(entry.get("content", "") or entry.get("text", "")).strip())
     if source == "trace":
         fields = ("origin_function", "status", "session_feedback", "method_return_value")
@@ -193,10 +199,11 @@ async def _run(prompt: str) -> dict | None:
     # so we call it once per scope and collect whatever succeeds.
     results: list = []
     scope_specs = [
-        (["session"], None),
-        (["trace"], None),
-        (["graph_context"], None),
-        (["graph"], "HYBRID_COMPLETION"),
+        (["session"], None, None),
+        (["trace"], None, None),
+        (["graph_context"], None, None),
+        (["graph"], "HYBRID_COMPLETION", None),
+        (["session_context"], None, "agent"),
     ]
     if not cloud_mode:
         import cognee
@@ -222,7 +229,7 @@ async def _run(prompt: str) -> dict | None:
         if _bopen:
             hook_log("recall_breaker_open", {"retry_in": _bretry})
             scope_specs = []
-    for scope_list, qtype in scope_specs:
+    for scope_list, qtype, context_profile in scope_specs:
         if time.monotonic() >= budget_deadline:
             hook_log("recall_budget_exceeded", {"collected": len(results)})
             break
@@ -235,6 +242,7 @@ async def _run(prompt: str) -> dict | None:
                     scope=scope_list,
                     only_context=True,
                     search_type=qtype,
+                    context_profile=context_profile,
                     timeout=recall_timeout,
                 )
             else:
@@ -248,6 +256,7 @@ async def _run(prompt: str) -> dict | None:
                         only_context=True,
                         query_type=query_type,
                         user=user,
+                        **({"context_profile": context_profile} if context_profile else {}),
                     ),
                     timeout=recall_timeout,
                 )
@@ -259,7 +268,12 @@ async def _run(prompt: str) -> dict | None:
     # Bucket results by _source for human-readable output.
     # Local SDK mode returns Pydantic models (ResponseQAEntry, etc.); cloud
     # mode returns plain dicts via HTTP. Normalize to dicts here.
-    by_source: dict[str, list] = {"session": [], "trace": [], "graph_context": []}
+    by_source: dict[str, list] = {
+        "session": [],
+        "trace": [],
+        "graph_context": [],
+        "session_context": [],
+    }
     for r in results or []:
         if hasattr(r, "model_dump"):
             r = r.model_dump()
@@ -317,12 +331,17 @@ async def _run(prompt: str) -> dict | None:
     header = (
         "Cognee memory: recall "
         f"{counts['session']} session / {counts['trace']} trace / "
-        f"{counts['graph_context']} graph; saved last turn "
+        f"{counts['graph_context']} graph / {counts['session_context']} agent; saved last turn "
         f"{saves_last_turn['prompt']} prompt / {saves_last_turn['trace']} trace / "
         f"{saves_last_turn['answer']} answer"
     )
 
     section_lines = []
+    if by_source.get("session_context"):
+        section_lines.append("=== Active agent guidance ===")
+        for e in by_source["session_context"]:
+            section_lines.append(_format_entry(e))
+            section_lines.append("")
     if by_source.get("graph_context"):
         section_lines.append("=== Knowledge graph snapshot ===")
         for e in by_source["graph_context"]:
