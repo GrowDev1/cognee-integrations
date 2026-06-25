@@ -21,7 +21,7 @@ import {
   migrateAgentScopeToPerAgent,
   SYNC_INDEX_PATH,
 } from "./persistence.js";
-import { datasetNameForScope, isMultiScopeEnabled, normalizeAgentId, routeFileToScope } from "./scope.js";
+import { cogneeSessionId, datasetNameForScope, isMultiScopeEnabled, normalizeAgentId, routeFileToScope } from "./scope.js";
 import { syncFiles, syncFilesScoped } from "./sync.js";
 
 /** Expand a leading `~` in a workspace path to the user's home directory. */
@@ -747,7 +747,7 @@ const memoryCogneePlugin = {
         await stateReady;
 
         // session_start isn't fired in every openclaw flow; sync from ctx on every hook.
-        if (cfg.enableSessions && ctx.sessionId) sessionId = ctx.sessionId;
+        if (cfg.enableSessions && ctx.sessionId) sessionId = cogneeSessionId(ctx.sessionId);
 
         if (!event.prompt || event.prompt.length < 5) {
           api.logger.debug?.("cognee-openclaw: skipping recall (prompt too short)");
@@ -873,7 +873,7 @@ const memoryCogneePlugin = {
 
         lastAgentId = ctx.agentId;
         lastWorkspaceDir = ctx.workspaceDir || resolvedWorkspaceDir;
-        if (cfg.enableSessions && ctx.sessionId) sessionId = ctx.sessionId;
+        if (cfg.enableSessions && ctx.sessionId) sessionId = cogneeSessionId(ctx.sessionId);
 
         const workspaceDir = ctx.workspaceDir || resolvedWorkspaceDir!;
         // Remember this agent's workspace so session_end can sweep the right one.
@@ -951,7 +951,7 @@ const memoryCogneePlugin = {
       });
 
       api.on("session_start", async (event) => {
-        if (cfg.enableSessions) sessionId = event.sessionId;
+        if (cfg.enableSessions) sessionId = cogneeSessionId(event.sessionId);
       });
 
       // Final sweep when the openclaw session closes. Catches memory file

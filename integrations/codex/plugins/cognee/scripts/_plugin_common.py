@@ -122,19 +122,21 @@ def set_session_key(session_key: str) -> str:
     return normalized
 
 
-def _generate_session_id(cwd: str = "") -> str:
-    """Mint a fresh Cognee session id for a new launch.
+def _generate_session_id(cwd: str = "", host_key: str = "") -> str:
+    """Mint the Cognee session id for a launch: ``{agent}_{host_session_id}``.
 
-    Shape ``{prefix}_{dirname}_{token}`` keeps it human-readable in logs while
-    the random token guarantees a new session per launch. No host/Codex session
-    id is embedded — the host id is only a local correlation key (see below).
+    The host (Codex) session id maps 1:1 to the conversation, so embedding it
+    makes the Cognee session id deterministic per conversation and self-describing
+    in the Cognee dashboard. Falls back to ``{agent}_{dirname}_{token}`` only when
+    no host session id is available.
     """
-    prefix = (
-        _sanitize_session_key(os.environ.get("COGNEE_SESSION_PREFIX", "") or "codex") or "codex"
-    )
+    agent = _sanitize_session_key(os.environ.get("COGNEE_SESSION_PREFIX", "") or "codex") or "codex"
+    host = _sanitize_session_key(host_key)
+    if host:
+        return f"{agent}_{host}"
     cwd = cwd or os.environ.get("CODEX_CWD") or os.getcwd()
     dir_name = _sanitize_session_key(Path(cwd).name) or "session"
-    return f"{prefix}_{dir_name}_{uuid.uuid4().hex[:12]}"
+    return f"{agent}_{dir_name}_{uuid.uuid4().hex[:12]}"
 
 
 def _new_conn_uuid() -> str:
@@ -216,7 +218,7 @@ def resolve_cognee_session_id(host_key: str = "", cwd: str = "") -> str:
     if rec.get("session_id"):
         return _sanitize_session_key(str(rec["session_id"]))
 
-    new_id = _generate_session_id(cwd)
+    new_id = _generate_session_id(cwd, host_key)
     if not host_key:
         return new_id
     winner = _create_map_record_if_absent(
@@ -243,7 +245,7 @@ def ensure_launch_record(host_key: str = "", cwd: str = "") -> tuple[str, str]:
         return str(rec["session_id"]), str(rec["conn_uuid"])
 
     explicit = _sanitize_session_key(str(os.environ.get("COGNEE_SESSION_ID", "") or "").strip())
-    session_id = explicit or str(rec.get("session_id") or "") or _generate_session_id(cwd)
+    session_id = explicit or str(rec.get("session_id") or "") or _generate_session_id(cwd, host_key)
     conn_uuid = str(rec.get("conn_uuid") or "") or _new_conn_uuid()
     record = {
         "session_id": session_id,

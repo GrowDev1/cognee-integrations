@@ -123,6 +123,18 @@ export function normalizeAgentId(agentId: string | undefined, cfg: Required<Cogn
 }
 
 /**
+ * Build the Cognee session id from the host (OpenClaw) session id, following the
+ * cross-integration convention `{agent}_{native_session_id}` —
+ * e.g. `open_claw_<openclaw-session-id>`. Keeps the session self-describing in the
+ * Cognee dashboard and decoupled from working-directory/agent naming. Returns "" for
+ * an empty input so downstream truthy checks still skip an absent session id.
+ */
+export function cogneeSessionId(nativeSessionId: string | undefined): string {
+  const native = (nativeSessionId ?? "").trim();
+  return native ? `open_claw_${native}` : "";
+}
+
+/**
  * Resolve the Cognee dataset name for a given memory scope.
  *
  * `runtimeAgentId` lets multi-agent gateways pass the active agent's identity

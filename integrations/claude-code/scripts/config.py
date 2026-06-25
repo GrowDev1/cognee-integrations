@@ -31,7 +31,7 @@ _DEFAULTS = {
     "dataset": "agent_sessions",
     "agent_name": "claude-code-agent",
     "session_strategy": "per-directory",  # per-directory | git-branch | static
-    "session_prefix": "cc",
+    "session_prefix": "claude",  # agent name; session id is "{agent}_{host_session_id}"
     "top_k": 3,
     "backend": "auto",
     "user_email": "default_user@example.com",
