@@ -61,53 +61,59 @@ versions, and compatible cognee ranges.
 
 ## Quickstart
 
-The Python SDK integrations (Strands, CrewAI, LangGraph, Google ADK, Claude) share the
-same three steps. Example using Strands:
+The Claude Code integration is a **plugin** — it gives Claude Code persistent memory
+across sessions with no code to write. It auto-captures your prompts, tool traces, and
+responses, and auto-recalls relevant context on every prompt.
 
-**1. Install**
+**1. Install the plugin**
 
-```bash
-pip install cognee-integration-strands
-pip install "strands-agents[openai]"   # the examples drive an OpenAI model
+Run these slash commands directly in the Claude Code chat:
+
+```
+/plugin marketplace add topoteretes/cognee-integrations
+/plugin install cognee-memory@cognee
 ```
 
 **2. Configure your LLM key**
 
-Cognee extracts knowledge with an LLM, so set `LLM_API_KEY` (e.g. in a `.env` file):
+In local mode (the default), the plugin bootstraps a local Cognee API on
+`http://localhost:8011`. Cognee extracts knowledge with an LLM, so set `LLM_API_KEY`
+in the shell that launches Claude Code:
 
-```env
-LLM_API_KEY=your-openai-api-key-here
+```bash
+export LLM_API_KEY="sk-..."
 ```
 
-**3. Attach the cognee tools to your agent**
+To target Cognee Cloud or a remote server instead, set `COGNEE_BASE_URL` and
+`COGNEE_API_KEY`. On startup you should see a **"Cognee Memory Connected"** message.
 
-```python
-import os
-from cognee_integration_strands import cognee_tools
-from strands import Agent
-from strands.models.openai import OpenAIModel
+**3. Use Claude Code as usual**
 
-model = OpenAIModel(client_args={"api_key": os.getenv("LLM_API_KEY")}, model_id="gpt-4o")
-agent = Agent(model=model, tools=cognee_tools())
+Memory is captured and recalled automatically — no extra steps. You can also invoke the
+skills explicitly:
 
-# Store information in the persistent knowledge graph
-agent("Remember that we signed a contract with Meditech Solutions for £1.2M.")
-
-# A fresh agent has no chat history — it answers purely from cognee's memory
-fresh = Agent(model=model, tools=cognee_tools())
-print(fresh("What is the value of the Meditech Solutions contract?"))
 ```
+/cognee-memory:cognee-remember   # store something now
+/cognee-memory:cognee-search     # query memory
+/cognee-memory:cognee-sync       # persist the session into the graph
+```
+
+For full configuration (datasets, sessions, sync watchers, cloud mode), see
+[`integrations/claude-code/README.md`](integrations/claude-code/README.md).
+
+> **Using an agent framework instead?** The Python SDK integrations (Strands, CrewAI,
+> LangGraph, Google ADK, Claude Agent SDK) follow a `pip install` →
+> set `LLM_API_KEY` → attach `cognee_tools()` pattern. See each integration's README
+> under `integrations/<name>/` for a runnable example.
 
 ### Two memory tiers
 
-Built on cognee v1.0, every SDK integration exposes the same two tiers:
+Built on cognee v1.0, the integrations share the same two tiers:
 
-- **Permanent knowledge graph** (default) — `cognee_tools()` writes go straight to the graph.
-- **Session cache** — `cognee_tools(session_id="chat_1")` routes writes to a cheap per-session
-  cache (no graph extraction). Promote a session into the permanent graph later with
-  `cognee.improve(session_ids=["chat_1"])`.
-
-See the per-integration README for the exact tool names and the session-management flow.
+- **Permanent knowledge graph** — durable memory that survives across sessions.
+- **Session cache** — a cheap per-session cache (no graph extraction up front) that is
+  promoted into the permanent graph on sync (`/cognee-memory:cognee-sync`, or
+  `cognee.improve(session_ids=[...])` in the SDK integrations).
 
 ## Structure
 
