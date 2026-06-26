@@ -109,6 +109,61 @@ Built on cognee v1.0, every SDK integration exposes the same two tiers:
 
 See the per-integration README for the exact tool names and the session-management flow.
 
+## Using the Python Integrations
+
+Every Python integration installs from PyPI and follows the same shape: **install →
+set `LLM_API_KEY` → build the cognee tools → pass them to your agent.** The only thing
+that differs per framework is the import line and how you construct the agent.
+
+```bash
+pip install cognee-integration-strands       # or -crewai, -langgraph, -google-adk, -claude
+export LLM_API_KEY="sk-..."                   # cognee extracts knowledge with an LLM
+```
+
+The tools come in two styles depending on the integration's version:
+
+| Framework | Package | Build the tools with | Tools |
+|---|---|---|---|
+| Strands | `cognee-integration-strands` | `cognee_tools(session_id=None)` | `remember`, `recall` |
+| Claude Agent SDK | `cognee-integration-claude` | `cognee_tools(session_id=None)` | `remember`, `recall` |
+| CrewAI | `cognee-integration-crewai` | `from … import add_tool, search_tool` | `add_tool`, `search_tool` |
+| Google ADK | `cognee-integration-google-adk` | `from … import add_tool, search_tool` | `add_tool`, `search_tool` |
+| LangGraph | `cognee-integration-langgraph` | `get_sessionized_cognee_tools(user_id)` | `add_tool`, `search_tool` |
+
+**`cognee_tools()` style** (cognee v1.0 — Strands, Claude Agent SDK). Writes go to the
+permanent graph; pass `session_id=...` to use the session cache instead:
+
+```python
+from cognee_integration_strands import cognee_tools
+from strands import Agent
+from strands.models.openai import OpenAIModel
+
+agent = Agent(model=OpenAIModel(...), tools=cognee_tools())
+agent("Remember that we signed a contract with Meditech Solutions for £1.2M.")
+print(agent("What is the value of the Meditech Solutions contract?"))
+```
+
+**`add_tool` / `search_tool` style** (CrewAI, Google ADK, LangGraph). Here you also ingest
+source documents yourself with `cognee.add(...)` + `cognee.cognify()` before searching:
+
+```python
+import cognee
+from cognee_integration_crewai import add_tool, search_tool   # CrewAI / Google ADK
+from crewai import Agent
+
+await cognee.add("Meditech Solutions — healthcare industry, contract worth £1.2M.")
+await cognee.cognify()                                        # build the knowledge graph
+
+agent = Agent(role="Analyst", goal="…", backstory="…", tools=[add_tool, search_tool])
+print(agent.kickoff("Which contracts are in the healthcare industry?"))
+```
+
+LangGraph is the same style but builds its tools per user:
+`add_tool, search_tool = get_sessionized_cognee_tools("user-1")`.
+
+Each integration's `README.md` under `integrations/<name>/` has a complete runnable
+example (`examples/`) and the full tool reference.
+
 ## Structure
 
 Each integration lives under `integrations/<name>/` and is an independently publishable package.
