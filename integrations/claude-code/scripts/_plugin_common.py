@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1055,6 +1056,78 @@ def _json_http_request(
         return json.loads(body)
 
 
+def _float_env(name: str, default: float) -> float:
+    """Read a float from the environment, falling back to default on absence/parse error."""
+    try:
+        raw = os.environ.get(name, "").strip()
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def wait_for_cognify(
+    dataset_id: str,
+    *,
+    deadline_seconds: float,
+    interval_seconds: float = 3.0,
+    pipeline: str = "cognify_pipeline",
+    request_timeout: float = 10.0,
+) -> str:
+    """Poll GET /api/v1/datasets/status until the cognify pipeline is terminal or the deadline.
+
+    Returns one of:
+      "completed" — DATASET_PROCESSING_COMPLETED (graph queryable; safe to mark written)
+      "errored"   — DATASET_PROCESSING_ERRORED (do NOT mark; a later attempt should retry)
+      "timeout"   — deadline elapsed while still processing (do NOT mark; retry)
+      "unknown"   — cannot poll: no dataset_id, or the status route is absent (older server)
+
+    A background remember returns immediately with a dataset_id; this confirms the
+    server-side cognify actually finished instead of fire-and-forgetting, so the bridge
+    never holds one synchronous request open past the cloud's request ceiling.
+    """
+    if not dataset_id:
+        return "unknown"
+    path = (
+        f"/api/v1/datasets/status?dataset={urllib.parse.quote(str(dataset_id))}"
+        f"&pipeline={urllib.parse.quote(pipeline)}"
+    )
+    deadline = time.monotonic() + max(0.0, deadline_seconds)
+    while True:
+        try:
+            result = _json_http_request(path, None, method="GET", timeout=request_timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # Older server without the status route — can't confirm, don't loop.
+                return "unknown"
+            hook_log(
+                "cognify_poll_transient",
+                {"dataset_id": dataset_id, "error": f"HTTP {exc.code}"},
+            )
+            result = None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            hook_log("cognify_poll_transient", {"dataset_id": dataset_id, "error": str(exc)[:120]})
+            result = None
+
+        status = ""
+        if isinstance(result, dict) and result:
+            raw = result.get(str(dataset_id))
+            if raw is None and len(result) == 1:
+                raw = next(iter(result.values()))
+            # A multi-pipeline response nests {pipeline: status}; unwrap if needed.
+            if isinstance(raw, dict):
+                raw = raw.get(pipeline)
+            status = str(raw or "").upper()
+
+        if status.endswith("COMPLETED"):
+            return "completed"
+        if status.endswith("ERRORED"):
+            return "errored"
+
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(max(0.0, interval_seconds))
+
+
 def remember_entry_via_http(
     dataset: str,
     session_id: str,
@@ -1222,12 +1295,21 @@ def _post_remember_document(
     document: str,
     node_set: str,
     timeout: float,
-) -> bool:
+) -> dict:
+    """Submit a document to /api/v1/remember in the BACKGROUND.
+
+    Background avoids holding one synchronous request open for the full cognify,
+    which a large graph build can push past the cloud's request ceiling (the POST
+    is abandoned mid-flight even though the server finishes). Returns the enqueue
+    handle so the caller can poll completion:
+      {"ok": True, "dataset_id": <uuid|"">, "pipeline_run_id": <uuid|"">}
+    A non-2xx status is raised by urlopen (HTTPError) for the caller to handle.
+    """
     body, boundary = _multipart_body(
         {
             "datasetName": dataset,
             "node_set": node_set,
-            "run_in_background": "false",
+            "run_in_background": "true",
         },
         [("data", f"{node_set}.txt", document.encode("utf-8"))],
     )
@@ -1241,7 +1323,18 @@ def _post_remember_document(
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return 200 <= resp.status < 300
+        if not (200 <= resp.status < 300):
+            return {"ok": False, "dataset_id": "", "pipeline_run_id": ""}
+        raw = resp.read().decode("utf-8")
+    result = {"ok": True, "dataset_id": "", "pipeline_run_id": ""}
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        parsed = {}
+    if isinstance(parsed, dict):
+        result["dataset_id"] = str(parsed.get("dataset_id") or "")
+        result["pipeline_run_id"] = str(parsed.get("pipeline_run_id") or "")
+    return result
 
 
 def persist_session_cache_to_graph_via_http(
@@ -1270,6 +1363,14 @@ def persist_session_cache_to_graph_via_http(
         hook_log("http_bridge_skipped_empty_cache", {"dataset": dataset, "session": session_id})
         return False
 
+    # `timeout` is reinterpreted as the overall poll deadline (it used to be the
+    # synchronous read timeout). The POST itself is now fast (it only enqueues), so
+    # it gets a short submit budget; the wait happens by polling the status route.
+    poll_deadline = _float_env("COGNEE_BRIDGE_POLL_DEADLINE", timeout)
+    submit_timeout = _float_env("COGNEE_BRIDGE_SUBMIT_TIMEOUT", 30.0)
+    poll_interval = _float_env("COGNEE_COGNIFY_POLL_INTERVAL", 3.0)
+    status_timeout = _float_env("COGNEE_STATUS_REQUEST_TIMEOUT", 10.0)
+
     bridge_path = _bridge_file(session_id)
     bridge_cache = _load_json_file(bridge_path)
     state = bridge_cache.get("_state", {}) if isinstance(bridge_cache, dict) else {}
@@ -1285,9 +1386,35 @@ def persist_session_cache_to_graph_via_http(
             digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
             if state.get(state_key) == digest:
                 continue
-            if _post_remember_document(base_url, api_key, dataset, document, node_set, timeout):
+            submitted = _post_remember_document(
+                base_url, api_key, dataset, document, node_set, submit_timeout
+            )
+            if not submitted.get("ok"):
+                continue
+            dataset_id = submitted.get("dataset_id") or ""
+            if not dataset_id:
+                # Accepted, but no handle to confirm completion. Mark it written so we
+                # don't blindly resubmit and duplicate the cognify on the next attempt.
                 state[state_key] = digest
                 wrote = True
+                hook_log("http_bridge_no_dataset_id", {"dataset": dataset, "kind": kind})
+                continue
+            outcome = wait_for_cognify(
+                dataset_id,
+                deadline_seconds=poll_deadline,
+                interval_seconds=poll_interval,
+                request_timeout=status_timeout,
+            )
+            # Only mark written once the graph is confirmed queryable (completed) or we
+            # genuinely cannot poll (older server). errored/timeout stay unmarked so the
+            # detached retry (COGNEE_SYNC_RETRIES) re-submits.
+            if outcome in ("completed", "unknown"):
+                state[state_key] = digest
+                wrote = True
+            hook_log(
+                "http_bridge_poll",
+                {"dataset": dataset, "kind": kind, "outcome": outcome, "dataset_id": dataset_id},
+            )
         if isinstance(bridge_cache, dict):
             bridge_cache["_state"] = state
             _write_json_file(bridge_path, bridge_cache)
