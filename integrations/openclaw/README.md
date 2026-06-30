@@ -163,7 +163,7 @@ For a gateway with multiple named agents sharing a default dataset:
 
 > **Required fields when adding a `models.providers.<provider>` block**: `baseUrl` is required by the config schema. Omitting it causes a validation error that prevents the gateway from starting.
 
-By default, when `agents.list` has more than one entry, the plugin auto-enables `perAgentMemory` so each agent writes to its own dataset. Set `perAgentMemory: false` explicitly to share a single dataset across all agents.
+For multi-agent gateways, set `perAgentMemory: true` explicitly to give each agent its own isolated dataset. Without it, all agents share a single dataset regardless of how many are configured.
 
 ### Cognee Cloud
 
@@ -312,7 +312,7 @@ This lets the agent distinguish between personal context, shared knowledge, and 
 | `recallScopes` | string[] | `["agent","user","company"]` | Scopes to search during recall, in priority order |
 | `defaultWriteScope` | string | `agent` | Default scope for files not matching any route |
 | `scopeRouting` | object[] | (see above) | Path-to-scope routing rules |
-| `perAgentMemory` | boolean | `false` (auto-`true` when `agents.list` > 1) | Give each agent its own dataset via `agentDatasetPrefix`. Auto-enabled for multi-agent gateways; set explicitly to `false` to force a shared dataset. |
+| `perAgentMemory` | boolean | `false` | Give each agent its own dataset via `agentDatasetPrefix`. Must be set explicitly to `true` for multi-agent gateways that require dataset isolation. |
 
 ### Sessions
 

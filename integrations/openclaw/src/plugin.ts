@@ -57,6 +57,15 @@ const memoryCogneePlugin = {
   register(api: OpenClawPluginApi) {
     const cfg = resolveConfig(api.pluginConfig);
 
+    const raw = api.pluginConfig as Record<string, unknown> | null | undefined;
+    if (!raw?.datasetName && !process.env.COGNEE_PLUGIN_DATASET) {
+      api.logger.warn?.(
+        'cognee-openclaw: no datasetName configured — defaulting to "agent_sessions". ' +
+        'If upgrading from an older version where the default was "openclaw", ' +
+        'add datasetName: "openclaw" to your plugin config to preserve access to existing data.',
+      );
+    }
+
     const client = new CogneeHttpClient(cfg.baseUrl, cfg.apiKey, cfg.username, cfg.password, cfg.requestTimeoutMs, cfg.ingestionTimeoutMs, cfg.mode);
     const multiScope = isMultiScopeEnabled(cfg);
 
