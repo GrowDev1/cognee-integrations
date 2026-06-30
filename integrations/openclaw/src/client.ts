@@ -577,6 +577,24 @@ export class CogneeHttpClient {
     }
   }
 
+  async listApiKeys(): Promise<{ key: string; name?: string }[]> {
+    return this.fetchAPI<{ key: string; name?: string }[]>(
+      "/api/v1/auth/api-keys",
+      { method: "GET" },
+    );
+  }
+
+  async createApiKey(name: string): Promise<{ key: string }> {
+    return this.fetchAPI<{ key: string }>(
+      "/api/v1/auth/api-keys",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      },
+    );
+  }
+
   async listDatasets(): Promise<{ id: string; name: string }[]> {
     const path = this.isCloud ? "/datasets" : "/api/v1/datasets";
     return this.fetchAPI<{ id: string; name: string }[]>(path, { method: "GET" });

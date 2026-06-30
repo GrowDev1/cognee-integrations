@@ -1,5 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { randomUUID } from "node:crypto";
+import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentSyncIndexes, CogneeSearchResult, MemoryScope, ScopedSyncIndexes, SyncIndex, SyncResult } from "./types.js";
@@ -24,7 +25,7 @@ import {
 } from "./persistence.js";
 import { cogneeSessionId, datasetNameForScope, isMultiScopeEnabled, normalizeAgentId, routeFileToScope } from "./scope.js";
 import { syncFiles, syncFilesScoped } from "./sync.js";
-import { bootServerIfNeeded, waitForServerHealth, isLocalUrl } from "./server.js";
+import { bootServerIfNeeded, waitForServerHealth, isLocalUrl, resolveOrMintApiKey, spawnExitWatcher, exitWatcherPidfilePath } from "./server.js";
 
 /** Expand a leading `~` in a workspace path to the user's home directory. */
 function expandHome(p: string | undefined): string | undefined {
@@ -138,6 +139,7 @@ const memoryCogneePlugin = {
 
     let resolvedWorkspaceDir: string | undefined;
     let gatewayAnchorName: string | undefined;
+    let resolvedApiKey: string | undefined;
     let resolveServiceReady: (() => void) | undefined;
     const serviceReady = new Promise<void>((r) => { resolveServiceReady = r; });
 
@@ -728,6 +730,10 @@ const memoryCogneePlugin = {
         }
       }
 
+      if (!resolvedApiKey) {
+        resolvedApiKey = await resolveOrMintApiKey(client, logger).catch(() => "");
+      }
+
       if (cfg.enableSessions) {
         const anchorName = `cognee-openclaw-gateway-${randomUUID()}`;
         try {
@@ -737,6 +743,14 @@ const memoryCogneePlugin = {
           });
           gatewayAnchorName = anchorName;
           logger.info?.("cognee-openclaw: gateway anchor registered");
+          spawnExitWatcher({
+            gatewayPid: process.pid,
+            agentSessionName: anchorName,
+            baseUrl: cfg.baseUrl,
+            apiKey: resolvedApiKey || cfg.apiKey,
+            pidfilePath: exitWatcherPidfilePath(anchorName),
+            logger,
+          }).catch(() => {});
         } catch (e) {
           logger.warn?.(`cognee-openclaw: gateway anchor registration failed: ${String(e)}`);
         }
@@ -765,8 +779,10 @@ const memoryCogneePlugin = {
       try {
         const { activeAgents } = await client.unregisterAgent({ agentSessionName: name });
         api.logger.info?.(`cognee-openclaw: gateway anchor unregistered (activeAgents=${activeAgents})`);
+        unlink(exitWatcherPidfilePath(name)).catch(() => {});
       } catch (e) {
         api.logger.warn?.(`cognee-openclaw: gateway anchor unregister failed: ${String(e)}`);
+        // Pidfile intentionally left — exit-watcher will deregister when it detects gateway death.
       }
     });
 
@@ -815,6 +831,14 @@ const memoryCogneePlugin = {
             datasetNames: resolveAgentDatasetNames(ctx.agentId),
           }).then(({ connectionId }) => {
             api.logger.info?.(`cognee-openclaw: agent registered${connectionId ? ` connectionId=${connectionId}` : ""}`);
+            spawnExitWatcher({
+              gatewayPid: process.pid,
+              agentSessionName,
+              baseUrl: cfg.baseUrl,
+              apiKey: resolvedApiKey || cfg.apiKey,
+              pidfilePath: exitWatcherPidfilePath(agentSessionName),
+              logger: api.logger,
+            }).catch(() => {});
           }).catch((e: unknown) => {
             registeredSessions.delete(regKey);
             agentSessionNames.delete(regKey);
@@ -1104,8 +1128,10 @@ const memoryCogneePlugin = {
           try {
             const { activeAgents } = await client.unregisterAgent({ agentSessionName });
             api.logger.info?.(`cognee-openclaw: agent unregistered (activeAgents=${activeAgents})`);
+            unlink(exitWatcherPidfilePath(agentSessionName)).catch(() => {});
           } catch (e) {
             api.logger.warn?.(`cognee-openclaw: agent unregister failed: ${String(e)}`);
+            // Pidfile intentionally left — exit-watcher will deregister when it detects gateway death.
           } finally {
             agentSessionNames.delete(regKey);
             registeredSessions.delete(regKey);
