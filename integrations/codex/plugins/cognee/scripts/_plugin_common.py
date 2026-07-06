@@ -475,6 +475,59 @@ def _bridge_file(session_id: str = "") -> Path:
     return _BRIDGE_DIR / f"{_agent_session_scope(session_id)}.json"
 
 
+# Short mutex for read-modify-write of the per-session buffer file. Appends
+# from concurrent async hooks (and the drain's trim write-back) would otherwise
+# clobber each other: os.replace keeps the file valid but last-writer-wins,
+# silently dropping the other writer's entry. Critical sections are
+# milliseconds, so waiting is cheap.
+_BUFFER_LOCK = _PLUGIN_DIR / "buffer.lock"
+_BUFFER_LOCK_STALE_SECONDS = 15.0
+_BUFFER_LOCK_TIMEOUT_SECONDS = 1.0
+_BUFFER_LOCK_POLL_SECONDS = 0.02
+
+
+@contextmanager
+def _buffer_lock():
+    """Acquire the buffer-file mutex, waiting briefly; fail open on timeout.
+
+    Yields True when the lock was acquired. On timeout/error the caller
+    proceeds WITHOUT the lock — a rare lost update beats a hook that hangs.
+    """
+    deadline = time.monotonic() + _BUFFER_LOCK_TIMEOUT_SECONDS
+    acquired = False
+    while True:
+        try:
+            _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+            if _BUFFER_LOCK.exists():
+                try:
+                    if time.time() - _BUFFER_LOCK.stat().st_mtime > _BUFFER_LOCK_STALE_SECONDS:
+                        _BUFFER_LOCK.unlink()
+                except FileNotFoundError:
+                    pass
+            fd = os.open(str(_BUFFER_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                hook_log("buffer_lock_timeout", {})
+                break
+            time.sleep(_BUFFER_LOCK_POLL_SECONDS)
+        except Exception as exc:
+            hook_log("buffer_lock_error", {"error": str(exc)[:200]})
+            break
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                _BUFFER_LOCK.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                hook_log("buffer_lock_release_failed", {"error": str(exc)[:200]})
+
+
 def append_http_bridge_entry(
     dataset: str,
     session_id: str,
@@ -494,14 +547,15 @@ def append_http_bridge_entry(
     if not (question or answer or trace):
         return
 
-    cache = _load_json_file(_bridge_file(session_id))
-    key = _bridge_cache_key(dataset, session_id)
-    session_cache = cache.setdefault(key, {"qa": [], "trace": []})
-    if question or answer:
-        session_cache.setdefault("qa", []).append({"question": question, "answer": answer})
-    if trace:
-        session_cache.setdefault("trace", []).append(trace)
-    _write_json_file(_bridge_file(session_id), cache)
+    with _buffer_lock():
+        cache = _load_json_file(_bridge_file(session_id))
+        key = _bridge_cache_key(dataset, session_id)
+        session_cache = cache.setdefault(key, {"qa": [], "trace": []})
+        if question or answer:
+            session_cache.setdefault("qa", []).append({"question": question, "answer": answer})
+        if trace:
+            session_cache.setdefault("trace", []).append(trace)
+        _write_json_file(_bridge_file(session_id), cache)
 
 
 async def resolve_user(user_id: str):
@@ -1343,11 +1397,12 @@ def append_warmup_entry(dataset: str, session_id: str, entry: dict) -> None:
     """
     if not dataset or not session_id or not isinstance(entry, dict):
         return
-    cache = _load_json_file(_bridge_file(session_id))
-    key = _bridge_cache_key(dataset, session_id)
-    session_cache = cache.setdefault(key, {"qa": [], "trace": []})
-    session_cache.setdefault("pending_entries", []).append(entry)
-    _write_json_file(_bridge_file(session_id), cache)
+    with _buffer_lock():
+        cache = _load_json_file(_bridge_file(session_id))
+        key = _bridge_cache_key(dataset, session_id)
+        session_cache = cache.setdefault(key, {"qa": [], "trace": []})
+        session_cache.setdefault("pending_entries", []).append(entry)
+        _write_json_file(_bridge_file(session_id), cache)
 
 
 _DRAIN_LOCK = _PLUGIN_DIR / "drain.lock"
@@ -1419,24 +1474,25 @@ def drain_warmup_entries(dataset: str, session_id: str) -> tuple:
                 break
         remaining = len(snapshot) - drained
         if drained:
-            # Re-read before trimming: hooks may have appended new pending
-            # entries (or qa/trace mirror text) during the replay; writing back
-            # the stale snapshot would silently delete them.
-            cache = _load_json_file(path)
-            session_cache = cache.get(key) or {}
-            fresh = list(session_cache.get("pending_entries") or [])
-            if fresh[:drained] == snapshot[:drained]:
-                fresh = fresh[drained:]
-            else:
-                # Unexpected interleaving — remove the replayed entries by value.
-                for entry in snapshot[:drained]:
-                    try:
-                        fresh.remove(entry)
-                    except ValueError:
-                        pass
-            session_cache["pending_entries"] = fresh
-            cache[key] = session_cache
-            _write_json_file(path, cache)
+            # Re-read before trimming, under the buffer mutex: hooks may append
+            # new pending entries (or qa/trace mirror text) during the replay,
+            # and writing back a stale snapshot would silently delete them.
+            with _buffer_lock():
+                cache = _load_json_file(path)
+                session_cache = cache.get(key) or {}
+                fresh = list(session_cache.get("pending_entries") or [])
+                if fresh[:drained] == snapshot[:drained]:
+                    fresh = fresh[drained:]
+                else:
+                    # Unexpected interleaving — remove the replayed entries by value.
+                    for entry in snapshot[:drained]:
+                        try:
+                            fresh.remove(entry)
+                        except ValueError:
+                            pass
+                session_cache["pending_entries"] = fresh
+                cache[key] = session_cache
+                _write_json_file(path, cache)
             remaining = len(fresh)
             hook_log(
                 "warmup_drained",

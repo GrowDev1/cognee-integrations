@@ -22,13 +22,14 @@ import _plugin_common as pc  # noqa: E402
 
 
 def _with_tmp_bridge(fn):
-    """Run fn() with the bridge file and drain lock pointed at temp paths."""
-    saved = {k: getattr(pc, k) for k in ("_bridge_file", "hook_log", "_DRAIN_LOCK")}
+    """Run fn() with the bridge file and both locks pointed at temp paths."""
+    saved = {k: getattr(pc, k) for k in ("_bridge_file", "hook_log", "_DRAIN_LOCK", "_BUFFER_LOCK")}
     with tempfile.TemporaryDirectory() as tmp:
         bridge = pathlib.Path(tmp) / "bridge_test.json"
         pc._bridge_file = lambda sid="": bridge
         pc.hook_log = lambda *a, **k: None
         pc._DRAIN_LOCK = pathlib.Path(tmp) / "drain.lock"
+        pc._BUFFER_LOCK = pathlib.Path(tmp) / "buffer.lock"
         try:
             return fn()
         finally:
@@ -153,6 +154,49 @@ def test_drain_skipped_when_lock_busy():
     result, calls = _with_tmp_bridge(_run)
     assert result == (0, 1)  # skipped, nothing replayed, entry still pending
     assert calls == []
+
+
+def test_concurrent_appends_do_not_lose_entries():
+    # Two async hooks appending at the same moment must both land: the buffer
+    # mutex serializes the read-modify-write, so the last writer no longer
+    # clobbers the other's entry.
+    import concurrent.futures
+
+    def _run():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(
+                ex.map(
+                    lambda i: pc.append_warmup_entry(
+                        "ds", "sid", {"type": "trace", "origin_function": f"tool{i}"}
+                    ),
+                    range(8),
+                )
+            )
+        cache = pc._load_json_file(pc._bridge_file("sid"))
+        return (cache.get(pc._bridge_cache_key("ds", "sid")) or {}).get("pending_entries") or []
+
+    entries = _with_tmp_bridge(_run)
+    assert sorted(e["origin_function"] for e in entries) == [f"tool{i}" for i in range(8)]
+
+
+def test_append_fails_open_when_lock_held():
+    # A wedged lock must never make a hook hang or drop the entry: after the
+    # short wait the append proceeds without the lock.
+    def _run():
+        saved_timeout = pc._BUFFER_LOCK_TIMEOUT_SECONDS
+        pc._BUFFER_LOCK_TIMEOUT_SECONDS = 0.05
+        pc._BUFFER_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        pc._BUFFER_LOCK.write_text("held")  # fresh lock held by someone else
+        try:
+            pc.append_warmup_entry("ds", "sid", {"type": "trace", "origin_function": "X"})
+        finally:
+            pc._BUFFER_LOCK_TIMEOUT_SECONDS = saved_timeout
+            pc._BUFFER_LOCK.unlink()
+        cache = pc._load_json_file(pc._bridge_file("sid"))
+        return (cache.get(pc._bridge_cache_key("ds", "sid")) or {}).get("pending_entries")
+
+    entries = _with_tmp_bridge(_run)
+    assert entries and entries[0]["origin_function"] == "X"
 
 
 def test_drain_leaves_legacy_shadow_untouched():
