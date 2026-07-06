@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,7 +52,7 @@ SAVE_KINDS = ("prompt", "trace", "answer")
 _LOG_LINE_CAP = 600
 
 # Default auto-improve threshold (tool calls + stops). Env override.
-AUTO_IMPROVE_EVERY_DEFAULT = 30
+AUTO_IMPROVE_EVERY_DEFAULT = 150
 SYNC_LOCK_STALE_SECONDS = 15 * 60
 _DEFAULT_LOCAL_SERVICE_URL = "http://localhost:8011"
 
@@ -1283,3 +1284,187 @@ def persist_session_cache_to_graph_via_http(
             {"error": str(exc)[:200], "dataset": dataset, "session": session_id},
         )
         return False
+
+
+# --- Session improve (server-side session->graph bridge) ----------------------
+# The hooks write every turn into the SERVER session cache via /remember/entry,
+# so the server can bridge a session itself: POST /api/v1/improve runs feedback
+# weights, QA persist, trace-feedback persist, distillation, and enrichment over
+# that cache. This replaces the legacy full-document bridge above, which re-sent
+# the whole accumulated session text (raw tool outputs included) for a full
+# re-cognify on every sync. The legacy path is kept only as a fallback for
+# servers without session-aware improve.
+_IMPROVE_UNSUPPORTED_MARKER = _SHARED_PLUGIN_ROOT / "improve-unsupported.json"
+_IMPROVE_UNSUPPORTED_TTL_SECONDS = 24 * 3600
+
+
+def _improve_float_env(name: str, default: float) -> float:
+    try:
+        raw = os.environ.get(name, "").strip()
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _improve_submit_timeout() -> float:
+    return _improve_float_env("COGNEE_IMPROVE_SUBMIT_TIMEOUT", 180.0)
+
+
+def mark_improve_unsupported(base_url: str) -> None:
+    """Record that this server lacks the session-aware improve endpoint."""
+    _write_json_file(
+        _IMPROVE_UNSUPPORTED_MARKER,
+        {
+            "base_url": _normalize_service_url(base_url),
+            "marked_at": datetime.now(timezone.utc).timestamp(),
+        },
+    )
+
+
+def improve_unsupported(base_url: str) -> bool:
+    """True if this server recently rejected the improve endpoint (TTL-bounded)."""
+    data = _load_json_file(_IMPROVE_UNSUPPORTED_MARKER)
+    if not data:
+        return False
+    marked_url = _normalize_service_url(str(data.get("base_url") or ""))
+    if marked_url and marked_url != _normalize_service_url(base_url):
+        return False
+    marked_at = float(data.get("marked_at", 0) or 0)
+    return datetime.now(timezone.utc).timestamp() - marked_at < _IMPROVE_UNSUPPORTED_TTL_SECONDS
+
+
+def append_warmup_entry(dataset: str, session_id: str, entry: dict) -> None:
+    """Buffer a typed QA/trace entry while the server is still warming.
+
+    Per-turn stores go to the server session cache via /remember/entry; before
+    the server serves, those writes would be lost — and improve() bridges only
+    what the server cache holds. Buffered entries are replayed in order by
+    ``drain_warmup_entries`` once the server is ready.
+    """
+    if not dataset or not session_id or not isinstance(entry, dict):
+        return
+    cache = _load_json_file(_bridge_file(session_id))
+    key = _bridge_cache_key(dataset, session_id)
+    session_cache = cache.setdefault(key, {"qa": [], "trace": []})
+    session_cache.setdefault("pending_entries", []).append(entry)
+    _write_json_file(_bridge_file(session_id), cache)
+
+
+def drain_warmup_entries(dataset: str, session_id: str) -> int:
+    """Replay warmup-buffered entries into the server session cache, in order.
+
+    Returns the number of entries replayed. Stops at the first failure so the
+    unreplayed tail stays buffered for the next attempt (order preserved).
+    """
+    if not dataset or not session_id:
+        return 0
+    path = _bridge_file(session_id)
+    cache = _load_json_file(path)
+    key = _bridge_cache_key(dataset, session_id)
+    session_cache = cache.get(key) or {}
+    pending = list(session_cache.get("pending_entries") or [])
+    if not pending:
+        return 0
+    drained = 0
+    for entry in pending:
+        try:
+            remember_entry_via_http(dataset, session_id, entry)
+            drained += 1
+        except Exception as exc:
+            hook_log("warmup_drain_error", {"error": str(exc)[:200], "drained": drained})
+            break
+    if drained:
+        session_cache["pending_entries"] = pending[drained:]
+        cache[key] = session_cache
+        _write_json_file(path, cache)
+        hook_log(
+            "warmup_drained",
+            {"session": session_id, "count": drained, "left": len(pending) - drained},
+        )
+    return drained
+
+
+def improve_session_via_http(dataset: str, session_id: str, *, timeout: float = None) -> dict:
+    """Bridge one session into the graph via POST /api/v1/improve.
+
+    The server reads its own session cache (feedback weights, QA persist,
+    trace-feedback persist, distillation, enrichment), so no session text is
+    sent. ``run_in_background=true`` backgrounds the cognify-heavy pipelines,
+    but the agent-context and distillation stages still run inside the request,
+    so the submit timeout must stay generous — this must only ever be called
+    from detached workers/async hooks, never a synchronous hook window.
+
+    A 2xx submit counts as success: improve is idempotent (unchanged session
+    content dedups server-side by content hash, and a per-session improve lock
+    makes a concurrent run a no-op).
+    """
+    if not dataset or not session_id:
+        return {"ok": False, "error": "missing dataset/session"}
+    submit_timeout = timeout if timeout is not None else _improve_submit_timeout()
+    try:
+        result = _json_http_request(
+            "/api/v1/improve",
+            {
+                "dataset_name": dataset,
+                "session_ids": [session_id],
+                "run_in_background": True,
+            },
+            timeout=submit_timeout,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405, 422):
+            # Older server without session-aware improve: remember it (TTL'd)
+            # so callers fall back to the legacy document bridge.
+            mark_improve_unsupported(_local_api_url())
+            return {"ok": False, "unsupported": True, "status": exc.code}
+        return {"ok": False, "status": exc.code, "error": f"HTTP {exc.code}: {exc.reason}"}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"ok": False, "status": 0, "error": str(exc)[:200]}
+
+    if isinstance(result, dict) and not result:
+        # The server's per-session improve lock skipped this run ({} response):
+        # another improve is in flight. That run may have extracted the session
+        # cache BEFORE the latest turns landed, so a skip is NOT success — the
+        # caller must retry once the lock frees.
+        return {"ok": False, "busy": True}
+
+    return {"ok": True, "result": result if isinstance(result, dict) else {}}
+
+
+def run_session_improve(dataset: str, session_id: str) -> bool:
+    """API-mode session->graph sync: drain warmup entries, then improve.
+
+    Falls back to the legacy full-document bridge when the server does not
+    support session-aware improve. Returns True when a sync ran successfully.
+    """
+    base_url = _local_api_url()
+    if not _backend_reachable(base_url):
+        return False
+    drain_warmup_entries(dataset, session_id)
+    if improve_unsupported(base_url):
+        return persist_session_cache_to_graph_via_http(dataset, session_id)
+    outcome = improve_session_via_http(dataset, session_id)
+    if outcome.get("unsupported"):
+        hook_log("improve_unsupported_fallback", {"dataset": dataset, "session": session_id})
+        return persist_session_cache_to_graph_via_http(dataset, session_id)
+    # Busy = another improve holds the session lock (e.g. an idle-watcher run
+    # racing the SessionEnd sync). That run's snapshot may predate the latest
+    # turns, so wait for the lock to free and re-submit; the retried improve
+    # dedups unchanged content server-side, so this never double-processes.
+    busy_deadline = time.monotonic() + _improve_float_env("COGNEE_IMPROVE_BUSY_DEADLINE", 600.0)
+    busy_interval = max(0.1, _improve_float_env("COGNEE_IMPROVE_BUSY_RETRY_INTERVAL", 15.0))
+    while outcome.get("busy") and time.monotonic() < busy_deadline:
+        hook_log("improve_busy_retry", {"dataset": dataset, "session": session_id})
+        time.sleep(busy_interval)
+        outcome = improve_session_via_http(dataset, session_id)
+    hook_log(
+        "improve_fired",
+        {
+            "dataset": dataset,
+            "session": session_id,
+            "ok": bool(outcome.get("ok")),
+            "busy": bool(outcome.get("busy")),
+            "error": str(outcome.get("error") or "")[:120],
+        },
+    )
+    return bool(outcome.get("ok"))

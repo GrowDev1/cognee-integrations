@@ -27,10 +27,10 @@ from _plugin_common import (
     hook_log,
     http_api_ready,
     load_resolved,
-    persist_session_cache_to_graph_via_http,
     resolve_session_key_from_payload,
     resolve_user,
     resolved_http_endpoint_auth,
+    run_session_improve,
     set_session_key,
     sync_lock,
     unregister_agent_via_http,
@@ -40,9 +40,8 @@ from config import (
     ensure_dataset_ready,
     get_dataset,
     get_session_id,
+    improve_session_local,
     load_config,
-    persist_session_cache_to_graph,
-    sync_graph_context_to_session,
 )
 
 _STATE_DIR = Path.home() / ".cognee-plugin" / "codex"
@@ -216,7 +215,10 @@ def _load_resolved() -> tuple:
             os.environ["COGNEE_USER_ID"] = str(data.get("user_id"))
         return (
             env_session_id or data.get("session_id", ""),
-            env_dataset or data.get("dataset", ""),
+            # load_resolved() carries no dataset key, so without the env
+            # override (only the exit watcher sets it) this must fall back to
+            # config, or the SessionEnd worker syncs with an empty dataset.
+            env_dataset or data.get("dataset", "") or get_dataset(load_config()),
             data.get("user_id", ""),
             env_agent_session_name or data.get("agent_session_name", ""),
             bool(data.get("registered", False)),
@@ -276,19 +278,19 @@ async def _sync(stop_watcher: bool, unregister_on_finish: bool = False):
 
             if api_mode:
                 for sid in target_sessions:
-                    wrote = persist_session_cache_to_graph_via_http(dataset, sid)
+                    wrote = run_session_improve(dataset, sid)
                     hook_log(
                         "sync_bridge_done",
                         {
                             "session": sid,
                             "dataset": dataset,
-                            "via": "http_remember",
+                            "via": "http_improve",
                             "wrote": wrote,
                         },
                     )
                     print(
                         f"cognee-sync: dataset={dataset} session={sid} "
-                        f"via=http_remember wrote={wrote}",
+                        f"via=http_improve wrote={wrote}",
                         file=sys.stderr,
                     )
                 return
@@ -297,21 +299,20 @@ async def _sync(stop_watcher: bool, unregister_on_finish: bool = False):
             user = await resolve_user(user_id)
             await ensure_dataset_ready(dataset, user)
             for sid in target_sessions:
-                wrote = await persist_session_cache_to_graph(dataset, sid, user)
-                graph_result = await sync_graph_context_to_session(dataset, sid, user)
+                result = await improve_session_local(dataset, sid, user)
                 hook_log(
                     "sync_bridge_done",
                     {
                         "session": sid,
                         "dataset": dataset,
                         "user_id": str(getattr(user, "id", "")),
-                        "wrote": wrote,
-                        "graph_synced": graph_result.get("synced", 0),
+                        "via": "local_improve",
+                        "ok": bool(result.get("ok")),
                     },
                 )
                 print(
-                    f"cognee-sync: dataset={dataset} session={sid} wrote={wrote} "
-                    f"graph_synced={graph_result.get('synced', 0)}",
+                    f"cognee-sync: dataset={dataset} session={sid} "
+                    f"via=local_improve ok={result.get('ok')}",
                     file=sys.stderr,
                 )
     finally:
