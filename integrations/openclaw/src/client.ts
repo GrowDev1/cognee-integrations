@@ -31,7 +31,7 @@ export class CogneeHttpClient {
 
   constructor(
     readonly baseUrl: string,
-    private readonly apiKey?: string,
+    private apiKey?: string,
     private readonly username?: string,
     private readonly password?: string,
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
@@ -41,6 +41,19 @@ export class CogneeHttpClient {
 
   private get isCloud(): boolean {
     return this.mode === "cloud";
+  }
+
+  /**
+   * Inject an API key resolved/minted after construction (resolveOrMintApiKey).
+   * From then on every request authenticates with X-Api-Key and the JWT login
+   * fallback is never used again — the key is the principal identity, matching
+   * the claude-code/codex integrations. JWT login remains only as the one-time
+   * bootstrap that mints a key on a fresh LOCAL server (cloud has no login
+   * route, which is why COGNEE_API_KEY is mandatory there).
+   */
+  setApiKey(key: string): void {
+    const trimmed = (key ?? "").trim();
+    if (trimmed) this.apiKey = trimmed;
   }
 
   async login(): Promise<void> {
@@ -90,10 +103,11 @@ export class CogneeHttpClient {
       return { "X-Api-Key": this.apiKey! };
     }
     if (this.apiKey) {
-      return {
-        Authorization: `Bearer ${this.apiKey}`,
-        "X-Api-Key": this.apiKey,
-      };
+      // X-Api-Key ONLY — an API key is not a JWT, and servers that validate
+      // Authorization as a JWT (e.g. cloud pods) can reject the request on a
+      // bogus Bearer before the API key is even considered. Parity with the
+      // claude-code/codex integrations, which send only X-Api-Key.
+      return { "X-Api-Key": this.apiKey };
     }
     if (this.authToken) {
       return { Authorization: `Bearer ${this.authToken}` };

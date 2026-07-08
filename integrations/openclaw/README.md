@@ -184,7 +184,7 @@ With this, agent `Will` writes to dataset `myorg-agent-will`, agent `Elizabeth` 
 
 ### Cognee Cloud
 
-To use Cognee Cloud instead of a local instance, set `mode` to `"cloud"`:
+Cognee Cloud tenants (staging and production) serve the **same `/api/v1/*` API as a self-hosted server**, so connecting to the cloud is just the default configuration pointed at your tenant URL, with an API key:
 
 ```json
 {
@@ -193,8 +193,7 @@ To use Cognee Cloud instead of a local instance, set `mode` to `"cloud"`:
       "cognee-openclaw": {
         "enabled": true,
         "config": {
-          "mode": "cloud",
-          "baseUrl": "https://tenant-xxx.cloud.cognee.ai/api",
+          "baseUrl": "https://tenant-xxx.aws.cognee.ai",
           "apiKey": "${COGNEE_API_KEY}"
         }
       }
@@ -206,14 +205,15 @@ To use Cognee Cloud instead of a local instance, set `mode` to `"cloud"`:
 Or via environment variables:
 
 ```bash
-export COGNEE_MODE=cloud
-export COGNEE_BASE_URL=https://tenant-xxx.cloud.cognee.ai/api
+export COGNEE_BASE_URL=https://tenant-xxx.aws.cognee.ai
 export COGNEE_API_KEY=your-api-key
 ```
 
-**Cloud mode supported operations**: `remember` (new files), `recall`, per-item `forget`. The `/remember` and `/recall` endpoints are verified against self-hosted Cognee 1.0.3; cloud parity for these specific routes has not been validated yet — file an issue if you hit a 404.
+Do **not** set `mode: "cloud"` — leave it at the default. All operations (file sync, updates, recall, session capture, agent registration, improve) work against cloud tenants through the standard paths.
 
-**Known limitation**: Updating existing data (modifying a previously synced file) is not supported in cloud mode — `PATCH /update` is self-hosted only. In cloud mode the plugin's update path is a no-op; to edit a single file in place, delete it and re-add it via the [Cognee Cloud platform](https://platform.cognee.ai) or the API directly.
+> **`COGNEE_API_KEY` is mandatory for any remote/cloud server.** On a local server the plugin auto-mints a key on first use (a one-time JWT login as the default user bootstraps the mint); remote servers expose no login route, so there is nothing to mint with — every request authenticates via `X-Api-Key`. The variable must be present in the environment the **gateway process** starts from — a daemonized gateway does not see `export`s from your current shell. Set it, then `openclaw gateway stop && openclaw gateway start`.
+
+> **Deprecated: `mode: "cloud"` / `COGNEE_MODE=cloud`.** This mode targets a legacy path scheme (`baseUrl` ending `/api`, alias routes like `/recall` without the `/api/v1` prefix) that no current Cognee Cloud deployment serves — the platform control plane exposes no data routes, and tenants use the standard `/api/v1/*` paths. The mode is kept only for backward compatibility with older deployments; on current tenants it will 404. Newer capabilities (session capture, agent registration) are not implemented for the legacy scheme and never will be.
 
 ## Environment Variables
 
@@ -221,7 +221,7 @@ export COGNEE_API_KEY=your-api-key
 |----------|---------|-------------|
 | `COGNEE_BASE_URL` | `http://localhost:8011` | Cognee API base URL |
 | `COGNEE_PLUGIN_DATASET` | `agent_sessions` | Dataset name for single-scope mode. Overridden by `datasetName` in config if set. Same variable name used by the claude-code and codex Cognee integrations. |
-| `COGNEE_MODE` | `local` | `"local"` for self-hosted, `"cloud"` for Cognee Cloud |
+| `COGNEE_MODE` | `local` | **Deprecated** — leave at `"local"` for self-hosted *and* cloud tenants. `"cloud"` targets a legacy path scheme no current deployment serves (see "Cognee Cloud") |
 | `COGNEE_API_KEY` | — | API key (cloud mode or authenticated self-hosted) |
 | `COGNEE_USERNAME` | — | Login username (self-hosted with auth) |
 | `COGNEE_PASSWORD` | — | Login password (self-hosted with auth) |

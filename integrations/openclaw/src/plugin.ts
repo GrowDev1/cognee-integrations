@@ -815,6 +815,9 @@ const memoryCogneePlugin = {
       if (!resolvedApiKey) {
         resolvedApiKey = await resolveOrMintApiKey(client, logger).catch(() => "");
       }
+      // Inject the resolved/minted key so every subsequent client call
+      // authenticates via X-Api-Key instead of the JWT login fallback.
+      if (resolvedApiKey) client.setApiKey(resolvedApiKey);
 
       if (cfg.enableSessions) {
         const anchorName = `cognee-openclaw-gateway-${randomUUID()}`;
@@ -1009,6 +1012,10 @@ const memoryCogneePlugin = {
             if (!resolvedApiKey) {
               resolvedApiKey = await resolveOrMintApiKey(client, api.logger).catch(() => "");
             }
+            // Inject into THIS instance's client — each plugin instance owns
+            // its own client, and only key-authenticated calls work on servers
+            // without the login route (cloud pods).
+            if (resolvedApiKey) client.setApiKey(resolvedApiKey);
             const { connectionId } = await client.registerAgent({
               agentSessionName,
               sessionId: ctx.sessionId,
@@ -1359,6 +1366,16 @@ const memoryCogneePlugin = {
 
       const runFinalChain = async () => {
         await Promise.all([stateReady, serviceReadyWithTimeout()]);
+
+        // session_end can land on a plugin instance that never handled a
+        // prompt (OpenClaw registers several instances), so its client may
+        // still be keyless — resolve + inject here too, or the sweep/improve
+        // below fall back to JWT login, which servers without a login route
+        // (cloud tenants) answer with 404.
+        if (!resolvedApiKey) {
+          resolvedApiKey = await resolveOrMintApiKey(client, api.logger).catch(() => "");
+        }
+        if (resolvedApiKey) client.setApiKey(resolvedApiKey);
 
         // Step 1: final file sweep — catches memory file edits that happened
         // outside an agent_end.

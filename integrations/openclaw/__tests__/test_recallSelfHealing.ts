@@ -99,6 +99,7 @@ beforeEach(() => {
     recall: mockRecall,
     listDatasets: mockListDatasets,
     health: jest.fn(async () => ({ status: "ok" })),
+    setApiKey: jest.fn(),
   }));
 });
 

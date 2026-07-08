@@ -79,6 +79,7 @@ beforeEach(() => {
     unregisterAgent: mockUnregisterAgent,
     improve: mockImprove,
     health: mockHealth,
+    setApiKey: jest.fn(),
   }));
 });
 
