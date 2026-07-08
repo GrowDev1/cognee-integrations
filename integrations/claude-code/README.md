@@ -93,11 +93,8 @@ Set a custom dataset at launch:
 export COGNEE_PLUGIN_DATASET="my-project-memory"
 ```
 
-Or persist it in `~/.cognee-plugin/claude-code/config.json`:
-
-```json
-{ "dataset": "my-project-memory" }
-```
+`~/.cognee-plugin/claude-code/config.json` may still show a `dataset` value for
+visibility, but runtime dataset selection does not read it.
 
 The dataset is fixed for the lifetime of a launch. Recall searches only the active dataset. If you want to
 change the active dataset, you have to exit Claude, change the dataset via env, and then start Claude again.
@@ -195,9 +192,9 @@ cognee: my-project · cloud
 It is configured automatically on first launch — no manual steps needed. SessionStart writes the correct path into `~/.claude/settings.json` and Claude Code hot-reloads it, so the status line appears from your first interaction onward.
 
 The status line reads only local state — no network calls on every refresh:
-1. `COGNEE_PLUGIN_DATASET` / `COGNEE_BASE_URL` env vars (if set in the terminal that launched Claude Code)
-2. `~/.cognee-plugin/claude-code/config.json` → `dataset` and `base_url` keys
-3. Default: `cognee: agent_sessions · local`
+1. Dataset: `COGNEE_PLUGIN_DATASET` env var, otherwise `agent_sessions`
+2. Mode: `COGNEE_BASE_URL` env var, then `~/.cognee-plugin/claude-code/config.json` (`base_url`)
+3. Default mode: `local`
 
 ## Auto-clear demo hook
 
@@ -257,7 +254,7 @@ There is no automatic update mechanism — reinstall is the only way to pull in 
 ## Troubleshooting
 
 **Recall returns empty but data was ingested**
-- Recall is scoped to the active dataset (`COGNEE_PLUGIN_DATASET` / `config.json` / `agent_sessions`).
+- Recall is scoped to the active dataset (`COGNEE_PLUGIN_DATASET` / `agent_sessions`).
 - Data written via the Python SDK or `client.py` goes to `default_dataset` by default, if dataset not otherwise specified.
 - To verify, call the recall API directly without a dataset filter: `curl -X POST "$COGNEE_BASE_URL/api/v1/recall" -d '{"query":"..."}'`
 
@@ -286,7 +283,7 @@ Config precedence:
 
 | Key | Env var(s) | Default | Notes |
 |---|---|---|---|
-| `dataset` | `COGNEE_PLUGIN_DATASET` | `agent_sessions` | Dataset for writes and recall |
+| `dataset` | `COGNEE_PLUGIN_DATASET` | `agent_sessions` | Dataset for writes and recall (config value is informational-only) |
 | `session_id` | `COGNEE_SESSION_ID` | auto-generated per launch | Override to resume a named session |
 | `session_strategy` | `COGNEE_SESSION_STRATEGY` | `per-directory` | `per-directory`, `git-branch`, `static` |
 | `session_prefix` | `COGNEE_SESSION_PREFIX` | `cc` | Prefix for auto-generated session IDs |
