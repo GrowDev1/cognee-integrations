@@ -1,7 +1,7 @@
 /**
  * Managed Cognee server lifecycle.
  *
- * When the plugin owns the server (`config.managed === true`), the init hook
+ * When the plugin owns the server (`config.mode === "local"`), the init hook
  * calls `ensureLocalServer` to bring a local Cognee server up before the
  * memory hooks run. The flow is:
  *
@@ -29,6 +29,7 @@ import {
   writeServerPid,
   serverLogPath,
   pluginStateDir,
+  resolveLlmApiKey,
 } from "./plugin-common.ts";
 import { backendReachable } from "./cognee-client.ts";
 
@@ -238,7 +239,7 @@ export async function ensureLocalServer(
       { configured: cfg.server.python },
       "no Python interpreter found — cannot start managed cognee server. " +
         "Install Python 3.12+, set config.server.python to its path, or point " +
-        "the plugin at a remote server (set managed=false + base_url).",
+        "the plugin at a remote server (set mode=cloud + base_url).",
     );
     hookLog("managed_no_python", { configured: cfg.server.python });
     return false;
@@ -248,8 +249,11 @@ export async function ensureLocalServer(
   const ready = await ensureVenv(python, cfg.server, logger);
   if (!ready) return false;
 
-  // 4. Spawn the server.
-  const pid = spawnServer(cfg.server, logger);
+  // 4. Spawn the server, passing the LLM API key through to the server env.
+  const llmKey = await resolveLlmApiKey(cfg);
+  const serverEnv = { ...cfg.server.env };
+  if (llmKey) serverEnv.COGNEE_LLM_API_KEY = llmKey;
+  const pid = spawnServer({ ...cfg.server, env: serverEnv }, logger);
   if (!pid) return false;
 
   // 5. Wait for it to answer the healthcheck.
