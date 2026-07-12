@@ -8,5 +8,10 @@
   "keywords": ["memory", "knowledge-graph", "cognee", "reasoning", "session"],
   "peerDependencies": {
     "@vellumai/plugin-api": "^0.10.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^22.0.0",
+    "@types/bun": "^1.2.0"
   }
 }

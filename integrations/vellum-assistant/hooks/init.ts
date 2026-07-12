@@ -180,7 +180,7 @@ export default async function init(ctx: InitContext): Promise<void> {
   // on the local default), check the credential store for a base_url
   // override. This enables Option B: set cognee:base_url credential and
   // skip the config.json step entirely.
-  if (!fromContext || !("base_url" in (ctx.config ?? {}))) {
+  if (!fromContext || !("base_url" in (ctx.config as object ?? {}))) {
     const credUrl = await resolveBaseUrl(cfg);
     if (credUrl) {
       cfg.baseUrl = credUrl.replace(/\/+$/, "");

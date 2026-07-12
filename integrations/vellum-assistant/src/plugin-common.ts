@@ -1065,8 +1065,6 @@ export function serverLogPath(): string {
 
 // ─── Git branch detection (for session IDs) ───────────────────────────────────
 
-import { spawn } from "bun";
-
 export async function detectGitBranch(cwd: string): Promise<string> {
   try {
     const proc = spawn({
