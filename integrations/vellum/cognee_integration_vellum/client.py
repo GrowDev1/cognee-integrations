@@ -7,6 +7,7 @@ reimplemented ingestion or session handling.
 
 import asyncio
 import concurrent.futures
+import threading
 from typing import Any, Optional
 
 import cognee
@@ -15,21 +16,45 @@ from . import bootstrap  # noqa: F401  (loads .env on import)
 
 DEFAULT_DATASET_NAME = "main_dataset"
 
+# Vellum's node.run() / Agent Node tools are synchronous, but cognee is async.
+# Run every cognee coroutine on one persistent background event loop — a fresh
+# loop per call (asyncio.run) would strand cognee's loop-bound DB engine on a
+# closed loop. Mirrors the strands / langgraph integrations.
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_loop_lock = threading.Lock()
 
-def run_sync(coro):
-    """Run an async cognee call from Vellum's synchronous ``node.run()`` / tools.
+# cognee isn't safe to initialise concurrently, so serialise writes.
+_write_lock = asyncio.Lock()
 
-    Uses ``asyncio.run()`` when no event loop is active. If a loop is already
-    running (the caller is itself async), the coroutine is run in a worker
-    thread so we never touch the running loop.
-    """
+
+def _background_loop() -> asyncio.AbstractEventLoop:
+    """Lazily start one daemon thread running a dedicated event loop for cognee."""
+    global _loop
+    with _loop_lock:
+        if _loop is None:
+            _loop = asyncio.new_event_loop()
+
+            def _run() -> None:
+                # Pin the loop as this thread's current loop so cognee / its DB
+                # drivers resolve it via asyncio.get_event_loop() too.
+                asyncio.set_event_loop(_loop)
+                _loop.run_forever()
+
+            threading.Thread(target=_run, daemon=True).start()
+        return _loop
+
+
+def run_sync(coro, timeout: float = 300):
+    """Run an async cognee coroutine from synchronous Vellum code and block for
+    the result. Raises ``TimeoutError`` if it does not finish within ``timeout``
+    seconds, so a stalled call surfaces instead of hanging the workflow."""
+    future = asyncio.run_coroutine_threadsafe(coro, _background_loop())
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, coro).result()
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError as exc:
+        # concurrent.futures.TimeoutError is a distinct type from builtins on
+        # Python 3.10; normalise so callers can always ``except TimeoutError``.
+        raise TimeoutError(f"cognee call did not finish within {timeout}s") from exc
 
 
 async def remember(
@@ -49,7 +74,8 @@ async def remember(
     if user_id:
         kwargs["node_set"] = [user_id]
 
-    return await cognee.remember(data, **kwargs)
+    async with _write_lock:
+        return await cognee.remember(data, **kwargs)
 
 
 async def recall(
