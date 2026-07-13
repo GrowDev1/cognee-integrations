@@ -62,12 +62,19 @@ asyncio.run(main())
 > these are used from Python (as above) rather than auto-invoked by Aider. If
 > Aider adds such a hook, the same functions can be wired straight into it.
 
-## Run the example
+To use them *inside* an Aider coding session, wire them around Aider's
+[scripting API](https://aider.chat/docs/scripting.html) — recall context,
+run the `Coder`, store the outcome. `examples/aider_with_memory.py` shows the
+full pattern (needs `pip install aider-chat` and a configured model).
 
-Stores memories in two projects and shows recall is isolated to one of them:
+## Run the examples
 
 ```bash
+# memory + per-project isolation (cognee only)
 uv run python examples/aider_memory_demo.py
+
+# memory wired into a real Aider coding session (needs: pip install aider-chat)
+python examples/aider_with_memory.py
 ```
 
 ## Test
