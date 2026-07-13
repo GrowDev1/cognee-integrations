@@ -37,24 +37,17 @@ async def remember(
     *,
     dataset_name: str = DEFAULT_DATASET_NAME,
     user_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    run_in_background: bool = False,
 ):
     """Store data in cognee memory via the public ``remember()`` API.
 
-    ``run_in_background`` defaults to ``False`` (sync): ``remember()`` blocks
-    until the pipeline finishes, so the caller gets a real terminal status.
-    Per-end-user scoping maps ``user_id`` onto a cognee node set; one Vellum
-    workflow deployment maps to one ``dataset_name`` by default.
+    Synchronous: ``remember()`` blocks until the pipeline finishes, so the
+    caller gets a real terminal status. Per-end-user scoping maps ``user_id``
+    onto a cognee node set; one Vellum workflow deployment maps to one
+    ``dataset_name`` by default.
     """
-    kwargs: dict[str, Any] = {
-        "dataset_name": dataset_name,
-        "run_in_background": run_in_background,
-    }
+    kwargs: dict[str, Any] = {"dataset_name": dataset_name}
     if user_id:
         kwargs["node_set"] = [user_id]
-    if session_id:
-        kwargs["session_id"] = session_id
 
     return await cognee.remember(data, **kwargs)
 
@@ -64,7 +57,6 @@ async def recall(
     *,
     dataset_name: Optional[str] = DEFAULT_DATASET_NAME,
     user_id: Optional[str] = None,
-    session_id: Optional[str] = None,
     top_k: int = 15,
     include_references: bool = True,
 ):
@@ -82,8 +74,6 @@ async def recall(
         kwargs["datasets"] = [dataset_name]
     if user_id:
         kwargs["node_name"] = [user_id]
-    if session_id:
-        kwargs["session_id"] = session_id
 
     return await cognee.recall(query_text, **kwargs)
 

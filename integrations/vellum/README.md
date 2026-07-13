@@ -64,16 +64,15 @@ per `<module>/workflow.py`.
 ## Nodes
 
 ### `CogneeRememberNode`
-Stores data in cognee memory. **Synchronous by default** — it blocks until
-cognee finishes building the graph, so `status` / `error` are real the moment the
-node completes and downstream nodes can branch on them.
+Stores data in cognee memory. **Synchronous** — it blocks until cognee finishes
+building the graph, so `status` / `error` are real the moment the node completes
+and downstream nodes can branch on them.
 
 | Input | Default | Notes |
 |---|---|---|
 | `data` | `""` | Text to store |
 | `dataset_name` | `main_dataset` | One workflow deployment ↦ one dataset |
 | `user_id` | `""` | Optional per-end-user scope (maps to a cognee node set) |
-| `run_in_background` | `False` | Opt-in fire-and-return for large batch ingests |
 
 Outputs: `status`, `pipeline_run_id`, `error`, `dataset_name`.
 
@@ -87,8 +86,7 @@ Answers from cognee memory with citations to the source data.
 | `user_id` | `""` | Optional per-end-user scope |
 | `top_k` | `15` | Max results |
 
-Outputs: `answer`, `citations` (which dataset/document/chunk each hit came from),
-`results` (full typed recall payload).
+Outputs: `answer`, `citations` (which dataset/document/chunk each hit came from).
 
 ## Agent Node tools
 

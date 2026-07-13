@@ -4,8 +4,6 @@ Pushed to Vellum with ``vellum workflows push``, these appear as named node
 blocks in the visual editor (docstring included).
 """
 
-from typing import Any
-
 from vellum.workflows.nodes import BaseNode
 
 from . import client
@@ -14,16 +12,14 @@ from . import client
 class CogneeRememberNode(BaseNode):
     """Store data in cognee memory so later workflow executions can recall it.
 
-    Synchronous by default: the node blocks until cognee finishes building the
-    graph, so ``status`` / ``error`` are real the moment the node completes and
-    downstream nodes can branch on them. Set ``run_in_background=True`` to
-    fire-and-return for large batch ingests (the caller then polls status).
+    Synchronous: the node blocks until cognee finishes building the graph, so
+    ``status`` / ``error`` are real the moment the node completes and downstream
+    nodes can branch on them.
     """
 
     data: str = ""
     dataset_name: str = client.DEFAULT_DATASET_NAME
     user_id: str = ""
-    run_in_background: bool = False
 
     class Outputs(BaseNode.Outputs):
         status: str
@@ -37,7 +33,6 @@ class CogneeRememberNode(BaseNode):
                 self.data,
                 dataset_name=self.dataset_name,
                 user_id=self.user_id or None,
-                run_in_background=self.run_in_background,
             )
         )
         return self.Outputs(
@@ -52,8 +47,8 @@ class CogneeRecallNode(BaseNode):
     """Answer from cognee memory, with citations to the source data.
 
     Surfaces the retrieved ``answer`` plus typed ``citations`` (which
-    dataset/document/chunk each result came from) and the full ``results`` list
-    as node outputs, so a downstream node can render "answered from ...".
+    dataset/document/chunk each result came from) as node outputs, so a
+    downstream node can render "answered from ...".
     """
 
     query: str = ""
@@ -64,7 +59,6 @@ class CogneeRecallNode(BaseNode):
     class Outputs(BaseNode.Outputs):
         answer: str
         citations: list
-        results: list
 
     def run(self) -> "CogneeRecallNode.Outputs":
         responses = client.run_sync(
@@ -77,5 +71,4 @@ class CogneeRecallNode(BaseNode):
             )
         )
         answer, citations = client.extract_answer_and_citations(responses)
-        results: list[Any] = [r.model_dump() if hasattr(r, "model_dump") else r for r in responses]
-        return self.Outputs(answer=answer, citations=citations, results=results)
+        return self.Outputs(answer=answer, citations=citations)
