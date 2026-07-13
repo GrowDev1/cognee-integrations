@@ -166,11 +166,15 @@ integrations:
     notes: "CrewAI agent tools – add, search, session management"
 
   - slug: aider
-    name: "cognee-aider-integration"
-    path: integrations/aider
-    type: python
+    name: "Cognee Integration for Aider"
+    owner: cognee
     language: python
-    status: active
+    registry: none
+    package_name: null
+    cognee_dependency: sdk
+    current_version: "0.1.0"
+    migration_status: done
+    notes: "Aider CLI memory tools – sessionized add/cognify/search with per-project isolation"
 
   # ── Pending migrations ─────────────────────────────────────────────
 
