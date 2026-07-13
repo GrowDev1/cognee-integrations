@@ -84,16 +84,21 @@ def extract_answer_and_citations(responses):
 
     ``recall()`` returns a discriminated union of entry types, and the answer
     text lives in a different field per type: ``text`` on graph hits
-    (SearchResultItem), ``content`` on graph/session context entries, and
-    ``answer`` on session QA entries. We read all three so a session-based
-    recall (the support-assistant case) isn't dropped. ``dataset_name`` /
+    (SearchResultItem), ``content`` on graph/session context entries, ``answer``
+    on session QA entries, and ``memory_context`` on agent-trace entries. We
+    read all of them so no entry type is silently dropped. ``dataset_name`` /
     ``dataset_id`` / ``metadata`` / ``qa_id`` carry the source lineage.
     """
     answer_parts = []
     citations = []
 
     for r in responses:
-        text = getattr(r, "content", None) or getattr(r, "text", None) or getattr(r, "answer", None)
+        text = (
+            getattr(r, "content", None)
+            or getattr(r, "text", None)
+            or getattr(r, "answer", None)
+            or getattr(r, "memory_context", None)
+        )
         if text:
             answer_parts.append(text)
 

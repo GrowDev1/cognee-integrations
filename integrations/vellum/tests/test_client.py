@@ -36,6 +36,17 @@ class _QAEntry:
     text = None
 
 
+class _TraceEntry:
+    """Shaped like a cognee ``recall()`` agent-trace entry, whose answer lives in
+    ``.memory_context`` (not ``.content`` / ``.text`` / ``.answer``)."""
+
+    source = "trace"
+    memory_context = "The deploy step reruns migrations before restart."
+    content = None
+    text = None
+    answer = None
+
+
 def test_graph_entry_answer_and_typed_citation():
     answer, citations = extract_answer_and_citations([_GraphEntry()])
 
@@ -57,6 +68,15 @@ def test_session_qa_answer_is_captured_with_qa_id():
     assert "The capital of France is Paris." in answer
     assert citations[0]["source"] == "session"
     assert citations[0]["qa_id"] == "qa-1"
+
+
+def test_trace_entry_answer_is_captured_from_memory_context():
+    """An agent-trace entry stores its answer in ``.memory_context`` — it must
+    still surface rather than being silently dropped."""
+    answer, citations = extract_answer_and_citations([_TraceEntry()])
+
+    assert "The deploy step reruns migrations before restart." in answer
+    assert citations[0]["source"] == "trace"
 
 
 def test_mixed_entries_are_joined_with_a_citation_each():
