@@ -29,8 +29,10 @@ uv sync
 
 ## Configure
 
-Copy the example env file and edit it for your provider. The default runs
-locally and for free via [Ollama](https://ollama.com/) (`ollama serve`):
+Copy the example env file and add your key. It defaults to OpenAI (cognee's
+default provider); uncomment the Ollama block to run locally and for free via
+[Ollama](https://ollama.com/) (`ollama serve`). The package loads this `.env`
+automatically on import.
 
 ```bash
 cp .env.example .env

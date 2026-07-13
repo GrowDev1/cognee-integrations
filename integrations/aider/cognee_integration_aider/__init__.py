@@ -1,3 +1,4 @@
+from . import bootstrap
 from .tools import (
     add_project_memory,
     get_sessionized_cognee_tools,
@@ -6,6 +7,7 @@ from .tools import (
 )
 
 __all__ = [
+    "bootstrap",
     "add_project_memory",
     "search_project_memory",
     "get_sessionized_cognee_tools",

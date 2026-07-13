@@ -4,8 +4,8 @@ Stores memories in two separate project sessions and shows that a search
 scoped to one session does not see the other's data — i.e. real per-project
 isolation.
 
-Runs for free against a local Ollama. Copy ``.env.example`` to ``.env`` and
-adjust it for your provider first, then:
+Reads provider config from ``.env`` (copy ``.env.example`` first). Works with
+OpenAI by default, or Ollama for a free local run. Then:
 
     uv run python examples/aider_memory_demo.py
 """
