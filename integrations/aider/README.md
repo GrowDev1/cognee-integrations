@@ -9,7 +9,8 @@ OpenAI, any OpenAI-compatible API, or fully local models via Ollama.
 ## What it provides
 
 Two sessionized async tools, where a **session** is one project and each
-session gets its own isolated Cognee dataset:
+session gets its own isolated Cognee scope (a dataset tagged with a per-session
+node set, so one project's recall never surfaces another's):
 
 - `add_project_memory(session, content)` — store `content` and build the
   knowledge graph for that session.

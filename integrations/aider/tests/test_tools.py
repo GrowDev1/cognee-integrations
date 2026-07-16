@@ -2,9 +2,11 @@
 
 Cognee itself is mocked so the suite runs offline and for free (no LLM/API
 keys), but the assertions cover the real contract: that ``add`` builds the
-graph and that both tools stay scoped to the session's dataset — the two
-things a memory integration must get right to recall anything and to keep
-projects isolated.
+graph and tags it with the session's node set, and that ``search`` scopes to
+the same dataset + node name — the wiring a memory integration must get right
+to recall anything and to keep projects isolated. (That node-set/node-name
+scoping actually isolates is proven by the live example, which mocks can't
+show.)
 """
 
 from unittest.mock import AsyncMock, patch
@@ -38,8 +40,9 @@ async def test_add_builds_graph_scoped_to_session():
     ):
         result = await add_project_memory("alpha", "we use postgres")
 
-    add.assert_awaited_once_with("we use postgres", dataset_name=dataset)
-    # the graph MUST be built (scoped to the same dataset) or search finds nothing
+    # write is tagged with the session's node set (what actually scopes recall)
+    add.assert_awaited_once_with("we use postgres", dataset_name=dataset, node_set=[dataset])
+    # the graph MUST be built or search finds nothing
     cognify.assert_awaited_once_with(datasets=[dataset])
     assert "alpha" in result
 
@@ -51,8 +54,8 @@ async def test_search_is_scoped_to_the_session():
         search.return_value = ["postgres on 5432"]
         result = await search_project_memory("alpha", "which db?")
 
-    # search MUST pass the session's dataset, otherwise memory leaks across projects
-    search.assert_awaited_once_with("which db?", datasets=[dataset])
+    # search MUST scope by BOTH dataset and node name, or memory leaks across projects
+    search.assert_awaited_once_with("which db?", datasets=[dataset], node_name=[dataset])
     assert "postgres on 5432" in result
 
 
@@ -78,4 +81,5 @@ async def test_sessionized_tools_bind_the_session():
     with patch("cognee.search", new_callable=AsyncMock) as search_mock:
         search_mock.return_value = []
         await search("q")
-    search_mock.assert_awaited_once_with("q", datasets=[session_dataset("beta")])
+    ds = session_dataset("beta")
+    search_mock.assert_awaited_once_with("q", datasets=[ds], node_name=[ds])
