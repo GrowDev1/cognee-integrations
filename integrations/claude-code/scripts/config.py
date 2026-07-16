@@ -229,23 +229,68 @@ async def ensure_identity(config: dict):
         return user_id, ""
 
 
+def _cloud_http_request(
+    url: str,
+    *,
+    method: str = "GET",
+    api_key: str = "",
+    json_body: dict | None = None,
+    form_body: dict | None = None,
+    cookies: dict | None = None,
+    timeout: float = 10.0,
+) -> tuple[int, str]:
+    """Blocking stdlib-urllib HTTP for the cloud/remote setup path.
+
+    Cloud mode is a thin REST client that must run without the plugin venv
+    (which is only ever built in local mode), so these setup calls use urllib —
+    like the runtime hot path in ``_plugin_common`` — instead of aiohttp, which
+    would otherwise force the venv onto the cloud path just to be importable.
+
+    Returns ``(status_code, body_text)``. An HTTP error status is captured as
+    ``(code, body)`` rather than raised, so callers branch on the status exactly
+    as they did with aiohttp; network-level errors (URLError/timeout) still
+    raise, matching the aiohttp behavior the callers already guard against.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    headers: dict[str, str] = {}
+    data: bytes | None = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif form_body is not None:
+        data = urllib.parse.urlencode(form_body).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if api_key:
+        headers["X-Api-Key"] = str(api_key).strip()
+    if cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8")
+        except Exception:
+            body = ""
+        return exc.code, body
+
+
 async def _user_id_via_api(service_url: str, api_key: str) -> str:
     """Best-effort resolve the principal's user id from an API key."""
     if not service_url or not str(api_key or "").strip():
         return ""
 
-    import aiohttp
-
     base = service_url.rstrip("/")
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(
-            timeout=timeout, headers={"X-Api-Key": str(api_key).strip()}
-        ) as session:
-            async with session.get(f"{base}/api/v1/users/me") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return str(data.get("id", "") or "")
+        status, body = _cloud_http_request(f"{base}/api/v1/users/me", api_key=api_key, timeout=10.0)
+        if status == 200:
+            data = json.loads(body) if body else {}
+            return str(data.get("id", "") or "")
     except Exception as exc:
         _config_log("users_me_lookup_failed", {"error": str(exc)[:200]})
     return ""
@@ -261,15 +306,17 @@ async def ensure_dataset_ready_via_api(service_url: str, api_key: str, dataset: 
     if not service_url or not api_key or not dataset:
         return
 
-    import aiohttp
-
     base = service_url.rstrip("/")
-    async with aiohttp.ClientSession(headers={"X-Api-Key": api_key}) as session:
-        async with session.post(f"{base}/api/v1/datasets", json={"name": dataset}) as resp:
-            if resp.status in (200, 201):
-                return
-            text = await resp.text()
-            raise RuntimeError(f"remote dataset ensure failed ({resp.status}: {text[:200]})")
+    status, text = _cloud_http_request(
+        f"{base}/api/v1/datasets",
+        method="POST",
+        api_key=api_key,
+        json_body={"name": dataset},
+        timeout=30.0,
+    )
+    if status in (200, 201):
+        return
+    raise RuntimeError(f"remote dataset ensure failed ({status}: {text[:200]})")
 
 
 async def _ensure_identity_via_sdk() -> str:
@@ -313,13 +360,9 @@ async def ensure_cognee_ready(config: dict) -> None:
     """
     if is_cloud_mode(config):
         url = config["base_url"]
-        import aiohttp
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{url.rstrip('/')}/health") as resp:
-                if resp.status >= 400:
-                    text = await resp.text()
-                    raise RuntimeError(f"backend health check failed ({resp.status}: {text[:200]})")
+        status, text = _cloud_http_request(f"{url.rstrip('/')}/health", timeout=10.0)
+        if status >= 400:
+            raise RuntimeError(f"backend health check failed ({status}: {text[:200]})")
         print(f"cognee-plugin: connected to {url}", file=sys.stderr)
         return
 
