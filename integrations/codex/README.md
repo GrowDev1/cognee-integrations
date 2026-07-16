@@ -39,6 +39,8 @@ export COGNEE_BASE_URL="https://your-instance.cognee.ai"
 export COGNEE_API_KEY="ck_..."
 ```
 
+> Cloud mode is a pure thin client: it talks to your remote server over HTTP only and does **not** install a local Cognee runtime. The bundled virtualenv (`~/.cognee-plugin/venv`) is built only in local mode, where an in-process server actually runs.
+
 **Local mode** (default when `COGNEE_BASE_URL` is not set) — the plugin bootstraps a local Cognee API at `http://localhost:8011`. Only `LLM_API_KEY` is required; `COGNEE_API_KEY` is auto-minted if absent:
 
 ```bash
