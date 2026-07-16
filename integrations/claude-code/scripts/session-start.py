@@ -1132,7 +1132,14 @@ def _ensure_statusline_configured() -> None:
         return
 
     settings_path = Path.home() / ".claude" / "settings.json"
-    desired = {"type": "command", "command": str(statusline_sh)}
+    # Guard on the script's existence at run time. Claude Code does not remove
+    # this statusLine entry when the plugin is uninstalled, and the command runs
+    # through a shell — so if the plugin's files are later purged from the cache,
+    # a bare path would fail on every refresh. The `[ -x ] && exec … || true`
+    # guard degrades to a clean, empty status line instead. (When the files
+    # linger but the plugin is disabled, the renderer self-evicts this entry.)
+    guarded_command = f'[ -x "{statusline_sh}" ] && exec "{statusline_sh}" || true'
+    desired = {"type": "command", "command": guarded_command}
 
     try:
         settings: dict = {}
