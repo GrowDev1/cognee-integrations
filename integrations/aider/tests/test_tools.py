@@ -11,6 +11,7 @@ show.)
 
 from unittest.mock import AsyncMock, patch
 
+import cognee
 import pytest
 from cognee.modules.data.exceptions import DatasetNotFoundError
 from cognee_integration_aider import (
@@ -51,11 +52,17 @@ async def test_add_builds_graph_scoped_to_session():
 async def test_search_is_scoped_to_the_session():
     dataset = session_dataset("alpha")
     with patch("cognee.search", new_callable=AsyncMock) as search:
-        search.return_value = ["postgres on 5432"]
+        search.return_value = [{"text": "postgres on 5432", "document_id": "d1"}]
         result = await search_project_memory("alpha", "which db?")
 
-    # search MUST scope by BOTH dataset and node name, or memory leaks across projects
-    search.assert_awaited_once_with("which db?", datasets=[dataset], node_name=[dataset])
+    # A CHUNKS search scoped by BOTH dataset and node name — completion search
+    # types do not scope by node set on a shared graph and would leak across projects.
+    search.assert_awaited_once_with(
+        "which db?",
+        query_type=cognee.SearchType.CHUNKS,
+        datasets=[dataset],
+        node_name=[dataset],
+    )
     assert "postgres on 5432" in result
 
 
@@ -82,4 +89,6 @@ async def test_sessionized_tools_bind_the_session():
         search_mock.return_value = []
         await search("q")
     ds = session_dataset("beta")
-    search_mock.assert_awaited_once_with("q", datasets=[ds], node_name=[ds])
+    search_mock.assert_awaited_once_with(
+        "q", query_type=cognee.SearchType.CHUNKS, datasets=[ds], node_name=[ds]
+    )

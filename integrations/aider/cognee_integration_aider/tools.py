@@ -2,10 +2,15 @@
 
 Each session (typically one software project) maps to its own Cognee dataset
 and node set, so memories from different projects stay isolated on both write
-and read. cognee's ``datasets`` filter alone does not isolate graph-completion
-retrieval (the graph is a shared store), so writes are tagged with a per-session
-``node_set`` and reads are scoped with the matching ``node_name`` — the
-combination is what actually isolates one project's recall from another's.
+and read. Writes are tagged with a per-session ``node_set``; recall uses a
+``CHUNKS`` search scoped with the matching ``node_name``, which retrieves only
+that session's stored snippets.
+
+This matters because a local Cognee keeps one shared graph across datasets, and
+the *completion* search types (GRAPH_COMPLETION / RAG_COMPLETION) do not scope
+their retrieval by ``node_name`` — they synthesize an answer over the whole
+graph and would surface another project's facts. ``CHUNKS`` + ``node_name`` is
+what actually isolates one project's recall from another's (verified live).
 """
 
 import functools
@@ -42,17 +47,35 @@ async def add_project_memory(session: str, content: str) -> str:
     return f"Memory added to session '{session}'."
 
 
+def _chunk_text(result) -> str:
+    """Pull the stored snippet text out of one CHUNKS search result (dict/obj/str)."""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict):
+        return str(result.get("text", "")).strip()
+    return str(getattr(result, "text", "") or "").strip()
+
+
 async def search_project_memory(session: str, query: str) -> str:
-    """Retrieve memories relevant to ``query``, scoped to this session only."""
+    """Retrieve memories relevant to ``query``, scoped to this session only.
+
+    Uses a ``CHUNKS`` search filtered by the session's ``node_name`` so recall
+    returns only this project's stored snippets. Completion search types do not
+    scope their retrieval by node set on a shared local graph and would leak
+    other projects' facts, so they are deliberately not used here.
+    """
     dataset = session_dataset(session)
     try:
-        results = await cognee.search(query, datasets=[dataset], node_name=[dataset])
+        results = await cognee.search(
+            query, query_type=cognee.SearchType.CHUNKS, datasets=[dataset], node_name=[dataset]
+        )
     except DatasetNotFoundError:
         # Nothing has been stored in this session yet — recall before the first add.
         return "No memories found."
-    if not results:
+    snippets = [text for text in (_chunk_text(r) for r in results or []) if text]
+    if not snippets:
         return "No memories found."
-    return "\n".join(str(r) for r in results)
+    return "\n".join(snippets)
 
 
 def get_sessionized_cognee_tools(session: str) -> tuple[Callable, Callable]:
