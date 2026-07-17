@@ -20,6 +20,7 @@ _SHARED_ROOT = Path.home() / ".cognee-plugin"
 _CONFIG_PATH = _SHARED_ROOT / "claude-code" / "config.json"
 _SERVER_READY_PATH = _SHARED_ROOT / "server-ready.json"
 _BREAKER_PATH = _SHARED_ROOT / "recall-breaker.json"
+_UPDATE_CHECK_PATH = _SHARED_ROOT / "claude-code" / "update-check.json"
 _DEFAULT_DATASET = "agent_sessions"
 
 # Self-eviction: when the plugin is uninstalled/disabled but its files still
@@ -75,6 +76,30 @@ def _health_prefix() -> str:
     if _SERVER_READY_PATH.exists():
         return "● "
     return ""
+
+
+def _update_segment() -> str:
+    """Amber 'update available' segment, or '' — read purely from the marker.
+
+    The background idle watcher writes the marker; this stays network-free and
+    plugin-runtime-free (no ``_plugin_common`` import), consistent with the
+    renderer's pure-local design. Uses `\\033[1;33m` (bold + amber); terminals
+    that ignore bold still apply the amber, and the trailing reset prevents
+    color bleed into the rest of the bar.
+    """
+    if os.environ.get("COGNEE_UPDATE_CHECK", "").strip().lower() in ("0", "false", "no", "off"):
+        return ""
+    try:
+        marker = json.loads(_UPDATE_CHECK_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not (isinstance(marker, dict) and marker.get("update_available")):
+        return ""
+    installed = str(marker.get("installed_version") or "")
+    latest = str(marker.get("latest_version") or "")
+    if not (installed and latest):
+        return ""
+    return f"   \033[1;33m⬆ Cognee update available {installed}→{latest}\033[0m"
 
 
 def _read_json(path: Path) -> dict:
@@ -153,7 +178,9 @@ def main() -> None:
         _evict_own_statusline()
         return
 
-    sys.stdout.write(f"{_health_prefix()}cognee: {_active_dataset()} · {_active_mode()}")
+    sys.stdout.write(
+        f"{_health_prefix()}cognee: {_active_dataset()} · {_active_mode()}{_update_segment()}"
+    )
 
 
 if __name__ == "__main__":

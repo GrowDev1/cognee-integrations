@@ -1108,6 +1108,196 @@ def server_ready_hint(service_url: str = "") -> bool:
     return True
 
 
+# --- Plugin update check (Phase 2) -------------------------------------------
+# A background, once-a-day check comparing the installed plugin version against
+# the version published on the marketplace's git ref. The network call runs only
+# here (in the background idle watcher); the hot path (SessionStart message,
+# status line) merely READS the marker file this writes — never the network.
+# Talks only to raw.githubusercontent (CDN, no API rate limit) over the shared
+# certifi TLS context. Opt out with COGNEE_UPDATE_CHECK=off.
+_UPDATE_CHECK_FILE = _PLUGIN_DIR / "update-check.json"
+_UPDATE_CHECK_INTERVAL_DEFAULT = 86400.0
+_UPDATE_DEFAULT_REPO = "topoteretes/cognee-integrations"
+_UPDATE_DEFAULT_REF = "main"
+_UPDATE_PLUGIN_ENTRY = "cognee-memory"
+_KNOWN_MARKETPLACES = Path.home() / ".claude" / "plugins" / "known_marketplaces.json"
+
+
+def _update_check_enabled() -> bool:
+    return os.environ.get("COGNEE_UPDATE_CHECK", "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _parse_semver(value: str):
+    """Parse the numeric X.Y.Z core (ignoring any -pre/+build suffix); None if not X.Y.Z."""
+    core = str(value or "").strip().lstrip("vV").split("-", 1)[0].split("+", 1)[0]
+    parts = core.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def _semver_gt(a: str, b: str) -> bool:
+    pa, pb = _parse_semver(a), _parse_semver(b)
+    return bool(pa and pb and pa > pb)
+
+
+def _installed_plugin_version() -> str:
+    candidates = []
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+    if root:
+        candidates.append(Path(root) / ".claude-plugin" / "plugin.json")
+    candidates.append(Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json")
+    for path in candidates:
+        try:
+            version = str(json.loads(path.read_text(encoding="utf-8")).get("version") or "").strip()
+            if version:
+                return version
+        except Exception:
+            continue
+    return ""
+
+
+def _update_source() -> Optional[tuple]:
+    """Return (repo, ref) to read the published version from, or None to skip.
+
+    Reads the 'cognee' marketplace source from Claude's known_marketplaces.json.
+    A non-github source (e.g. a local-path dev install) returns None so local
+    checkouts never nag themselves; a missing/odd file falls back to the default
+    repo (the normal published case).
+    """
+    try:
+        data = json.loads(_KNOWN_MARKETPLACES.read_text(encoding="utf-8"))
+        entry = data.get("cognee") if isinstance(data, dict) else None
+        source = entry.get("source") if isinstance(entry, dict) else None
+        if isinstance(source, dict):
+            if source.get("source") == "github" and source.get("repo"):
+                return str(source["repo"]), str(source.get("ref") or _UPDATE_DEFAULT_REF)
+            return None  # non-github (local path / other): skip, don't self-nag
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        hook_log("update_source_read_failed", {"error": str(exc)[:200]})
+    return _UPDATE_DEFAULT_REPO, _UPDATE_DEFAULT_REF
+
+
+def _fetch_published_version(repo: str, ref: str, etag: str) -> tuple:
+    """GET the raw marketplace.json and read the plugin entry's version.
+
+    Returns (version, new_etag, error). version is '' on 304/not-found/error so
+    the caller keeps the previously-known latest.
+    """
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/.claude-plugin/marketplace.json"
+    req = urllib.request.Request(url, method="GET")
+    if etag:
+        req.add_header("If-None-Match", etag)
+    try:
+        with urllib.request.urlopen(req, timeout=5.0, context=_https_context()) as resp:
+            body = resp.read().decode("utf-8")
+            new_etag = resp.headers.get("ETag", "") or etag
+            data = json.loads(body)
+            plugins = data.get("plugins", []) if isinstance(data, dict) else []
+            for plugin in plugins:
+                if isinstance(plugin, dict) and plugin.get("name") == _UPDATE_PLUGIN_ENTRY:
+                    return str(plugin.get("version") or ""), new_etag, ""
+            return "", new_etag, "entry_not_found"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return "", etag, ""  # unchanged since last check
+        return "", etag, f"http_{exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return "", etag, str(exc)[:120]
+
+
+def maybe_check_for_update() -> None:
+    """Background, ≤once-a-day update check. Writes the marker. Never raises.
+
+    Call from a background process (the idle watcher) — never a synchronous hook,
+    since it may make a network call (bounded to 5s, ≤ once per interval).
+    """
+    try:
+        if not _update_check_enabled():
+            return
+        marker = _load_json_file(_UPDATE_CHECK_FILE)
+        interval = _float_env("COGNEE_UPDATE_CHECK_INTERVAL", _UPDATE_CHECK_INTERVAL_DEFAULT)
+        now = datetime.now(timezone.utc).timestamp()
+        if now - float(marker.get("last_checked_at", 0) or 0) < interval:
+            return  # checked recently
+        source = _update_source()
+        if source is None:
+            return  # local-dev / unknown source
+        repo, ref = source
+        installed = _installed_plugin_version()
+        latest, etag, error = _fetch_published_version(repo, ref, str(marker.get("etag") or ""))
+        if not latest:
+            latest = str(marker.get("latest_version") or "")  # 304/error: keep prior
+        update_available = bool(installed and latest and _semver_gt(latest, installed))
+        _write_json_file(
+            _UPDATE_CHECK_FILE,
+            {
+                "last_checked_at": now,
+                "installed_version": installed,
+                "latest_version": latest,
+                "update_available": update_available,
+                "etag": etag,
+                "source": f"{repo}@{ref}",
+                "error": error,
+                # preserved so the SessionStart message shows once per new version
+                "notified_version": str(marker.get("notified_version") or ""),
+            },
+        )
+        hook_log(
+            "update_check",
+            {
+                "installed": installed,
+                "latest": latest,
+                "available": update_available,
+                "error": error,
+            },
+        )
+    except Exception as exc:
+        hook_log("update_check_failed", {"error": str(exc)[:200]})
+
+
+def read_update_status() -> dict:
+    """Zero-network read of the update marker for surfacing.
+
+    Returns the marker dict only when an update is genuinely available; {} when
+    disabled, absent, or already current (so callers can treat truthiness as
+    "should nudge").
+    """
+    if not _update_check_enabled():
+        return {}
+    marker = _load_json_file(_UPDATE_CHECK_FILE)
+    if (
+        isinstance(marker, dict)
+        and marker.get("update_available")
+        and marker.get("installed_version")
+        and marker.get("latest_version")
+    ):
+        return marker
+    return {}
+
+
+def mark_update_notified(version: str) -> None:
+    """Record that the one-time SessionStart message for `version` has been shown."""
+    try:
+        marker = _load_json_file(_UPDATE_CHECK_FILE)
+        if not marker:
+            return
+        marker["notified_version"] = str(version or "")
+        _write_json_file(_UPDATE_CHECK_FILE, marker)
+    except Exception as exc:
+        hook_log("update_notified_write_failed", {"error": str(exc)[:200]})
+
+
 def resolve_runtime_mode() -> dict:
     """Resolve hook runtime mode from effective endpoint auth."""
     service_url_raw, url_source = _local_api_url_with_source()

@@ -1097,6 +1097,178 @@ def server_ready_hint(service_url: str = "") -> bool:
     return True
 
 
+# --- Plugin update check (Phase 2) -------------------------------------------
+# Background, once-a-day check comparing the installed plugin version against the
+# version published on the tracked git ref. The network call runs only here (in
+# the background idle watcher); the hot path (in-context status via
+# render_status_for_host, SessionStart nudge) merely READS the marker this
+# writes. Codex tracks the marketplace's git ref (main) rather than a version
+# pin, so the nudge is driven by comparing the published .codex-plugin/plugin.json
+# version to the installed one. Talks only to raw.githubusercontent over the
+# shared certifi TLS context. Opt out with COGNEE_UPDATE_CHECK=off.
+_UPDATE_CHECK_FILE = _PLUGIN_DIR / "update-check.json"
+_UPDATE_CHECK_INTERVAL_DEFAULT = 86400.0
+_UPDATE_DEFAULT_REPO = "topoteretes/cognee-integrations"
+_UPDATE_DEFAULT_REF = "main"
+_UPDATE_MANIFEST_PATH = "integrations/codex/plugins/cognee/.codex-plugin/plugin.json"
+
+
+def _update_check_enabled() -> bool:
+    return os.environ.get("COGNEE_UPDATE_CHECK", "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _parse_semver(value: str):
+    """Parse the numeric X.Y.Z core (ignoring any -pre/+build suffix); None if not X.Y.Z."""
+    core = str(value or "").strip().lstrip("vV").split("-", 1)[0].split("+", 1)[0]
+    parts = core.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def _semver_gt(a: str, b: str) -> bool:
+    pa, pb = _parse_semver(a), _parse_semver(b)
+    return bool(pa and pb and pa > pb)
+
+
+def _installed_plugin_version() -> str:
+    candidates = []
+    root = os.environ.get("PLUGIN_ROOT", "").strip()
+    if root:
+        candidates.append(Path(root) / ".codex-plugin" / "plugin.json")
+    candidates.append(Path(__file__).resolve().parent.parent / ".codex-plugin" / "plugin.json")
+    for path in candidates:
+        try:
+            version = str(json.loads(path.read_text(encoding="utf-8")).get("version") or "").strip()
+            if version:
+                return version
+        except Exception:
+            continue
+    return ""
+
+
+def _update_source() -> Optional[tuple]:
+    """(repo, ref) to read the published version from.
+
+    Codex stores marketplace config in ~/.codex/config.toml (not a JSON we parse
+    here) and tracks the ref rather than a version pin, so we read the published
+    version from the default repo/ref. The nudge is purely a version comparison,
+    so a local checkout only nags when it is behind the published version.
+    """
+    return _UPDATE_DEFAULT_REPO, _UPDATE_DEFAULT_REF
+
+
+def _fetch_published_version(repo: str, ref: str, etag: str) -> tuple:
+    """GET the raw .codex-plugin/plugin.json and read its version.
+
+    Returns (version, new_etag, error). version is '' on 304/missing/error so the
+    caller keeps the previously-known latest.
+    """
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{_UPDATE_MANIFEST_PATH}"
+    req = urllib.request.Request(url, method="GET")
+    if etag:
+        req.add_header("If-None-Match", etag)
+    try:
+        with urllib.request.urlopen(req, timeout=5.0, context=_https_context()) as resp:
+            body = resp.read().decode("utf-8")
+            new_etag = resp.headers.get("ETag", "") or etag
+            data = json.loads(body)
+            version = str(data.get("version") or "") if isinstance(data, dict) else ""
+            return version, new_etag, ("" if version else "version_missing")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return "", etag, ""  # unchanged since last check
+        return "", etag, f"http_{exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return "", etag, str(exc)[:120]
+
+
+def maybe_check_for_update() -> None:
+    """Background, ≤once-a-day update check. Writes the marker. Never raises.
+
+    Call from a background process (the idle watcher) — never a synchronous hook,
+    since it may make a network call (bounded to 5s, ≤ once per interval).
+    """
+    try:
+        if not _update_check_enabled():
+            return
+        marker = _load_json_file(_UPDATE_CHECK_FILE)
+        interval = _improve_float_env(
+            "COGNEE_UPDATE_CHECK_INTERVAL", _UPDATE_CHECK_INTERVAL_DEFAULT
+        )
+        now = datetime.now(timezone.utc).timestamp()
+        if now - float(marker.get("last_checked_at", 0) or 0) < interval:
+            return  # checked recently
+        source = _update_source()
+        if source is None:
+            return
+        repo, ref = source
+        installed = _installed_plugin_version()
+        latest, etag, error = _fetch_published_version(repo, ref, str(marker.get("etag") or ""))
+        if not latest:
+            latest = str(marker.get("latest_version") or "")  # 304/error: keep prior
+        update_available = bool(installed and latest and _semver_gt(latest, installed))
+        _write_json_file(
+            _UPDATE_CHECK_FILE,
+            {
+                "last_checked_at": now,
+                "installed_version": installed,
+                "latest_version": latest,
+                "update_available": update_available,
+                "etag": etag,
+                "source": f"{repo}@{ref}",
+                "error": error,
+                "notified_version": str(marker.get("notified_version") or ""),
+            },
+        )
+        hook_log(
+            "update_check",
+            {
+                "installed": installed,
+                "latest": latest,
+                "available": update_available,
+                "error": error,
+            },
+        )
+    except Exception as exc:
+        hook_log("update_check_failed", {"error": str(exc)[:200]})
+
+
+def read_update_status() -> dict:
+    """Zero-network read of the update marker; {} when disabled/absent/current."""
+    if not _update_check_enabled():
+        return {}
+    marker = _load_json_file(_UPDATE_CHECK_FILE)
+    if (
+        isinstance(marker, dict)
+        and marker.get("update_available")
+        and marker.get("installed_version")
+        and marker.get("latest_version")
+    ):
+        return marker
+    return {}
+
+
+def mark_update_notified(version: str) -> None:
+    """Record that the one-time SessionStart nudge for `version` has been shown."""
+    try:
+        marker = _load_json_file(_UPDATE_CHECK_FILE)
+        if not marker:
+            return
+        marker["notified_version"] = str(version or "")
+        _write_json_file(_UPDATE_CHECK_FILE, marker)
+    except Exception as exc:
+        hook_log("update_notified_write_failed", {"error": str(exc)[:200]})
+
+
 def resolve_runtime_mode() -> dict:
     """Resolve hook runtime mode from effective endpoint auth."""
     service_url, api_key = resolved_http_endpoint_auth()
