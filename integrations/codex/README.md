@@ -181,16 +181,56 @@ tail -f ~/.cognee-plugin/codex/exit-watcher.log
 tail -f ~/.cognee-plugin/codex/watcher.log
 ```
 
-## Update or remove
+## Updating
 
-Reinstall plugin after marketplace/plugin changes:
+The `cognee` marketplace tracks the repository's `main` branch (`git-subdir`,
+`ref: main`), so updates arrive as new commits — they are **not** gated by the
+plugin `version` field. Pull the latest with:
+
+```bash
+codex plugin marketplace upgrade cognee
+```
+
+`marketplace upgrade` resolves `main` to its current commit and force-reinstalls
+when it has moved; if nothing changed it reports no upgrade. Note there is **no
+per-plugin `codex plugin update`, and no automatic background updates** for
+user-added marketplaces — run `upgrade` when you want the latest.
+
+The `version` in `.codex-plugin/plugin.json` (see
+[`CHANGELOG.md`](./plugins/cognee/CHANGELOG.md)) follows semver and is bumped each
+release. It is the cache key and lets a normal load reinstall when it changes,
+but the commit ref above is what actually drives updates.
+
+If a stale cached copy persists, remove and re-add:
 
 ```bash
 codex plugin remove cognee@cognee
 codex plugin add cognee@cognee
 ```
 
-Remove plugin and marketplace:
+### Update notifications
+
+When a newer version is published, the plugin surfaces it automatically:
+
+- **In-context status:** a short `⬆ Cognee update available <installed>→<latest>`
+  segment appears in Cognee's status line (which Codex injects into the model's
+  context) and disappears once you update.
+- **SessionStart:** a one-time note per new version — *"Cognee update available
+  1.0.3 → 1.1.0 — run `codex plugin marketplace upgrade cognee`."*
+
+A background check in the idle watcher runs **at most once per day** and fetches a
+single public file — the plugin manifest on `main`, via `raw.githubusercontent.com`
+— to read the published version. It sends no data and no telemetry, uses a
+conditional (ETag) request, and fails silently when offline. Because Codex tracks
+`main`, the nudge fires on version bumps (releases), not on every commit. Turn it
+off with `COGNEE_UPDATE_CHECK=false`.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `COGNEE_UPDATE_CHECK` | `true` | Background "update available" check + status/SessionStart nudges |
+| `COGNEE_UPDATE_CHECK_INTERVAL` | `86400` | Minimum seconds between checks |
+
+## Remove
 
 ```bash
 codex plugin remove cognee@cognee

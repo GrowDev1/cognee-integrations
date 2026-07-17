@@ -1208,6 +1208,45 @@ def _apply_memory_preference(output: dict) -> dict:
     return result
 
 
+def _apply_update_nudge(output: dict) -> dict:
+    """Append a one-time 'update available' systemMessage (once per new version).
+
+    The version comparison + marker are produced by the background check in the
+    idle watcher; here we only READ the marker (no network). The status line
+    surfaces the same info ambiently on every refresh — this message is the
+    actionable, one-shot nudge. Shown once per newly-detected version (tracked
+    via ``notified_version``) so it never nags, and auto-stops once updated.
+    """
+    try:
+        from _plugin_common import mark_update_notified, read_update_status
+
+        status = read_update_status()
+    except Exception:
+        return output
+    if not status:
+        return output
+    installed = str(status.get("installed_version") or "")
+    latest = str(status.get("latest_version") or "")
+    if not (installed and latest) or status.get("notified_version") == latest:
+        return output
+
+    message = (
+        f"Cognee update available {installed} → {latest} — run "
+        "`/plugin update cognee-memory@cognee` (or enable marketplace auto-update)."
+    )
+    result = dict(output or {})
+    hso = dict(result.get("hookSpecificOutput") or {})
+    hso.setdefault("hookEventName", "SessionStart")
+    existing = str(hso.get("systemMessage") or "").strip()
+    hso["systemMessage"] = f"{existing}\n\n{message}" if existing else message
+    result["hookSpecificOutput"] = hso
+    try:
+        mark_update_notified(latest)
+    except Exception:
+        pass
+    return result
+
+
 async def _start(payload: dict | None = None) -> dict:
     _ensure_statusline_configured()
     config = load_config()
@@ -1368,6 +1407,7 @@ def main():
     except Exception as exc:
         hook_log("session_start_exception", {"error": str(exc)[:200]})
     output = _apply_memory_preference(output)
+    output = _apply_update_nudge(output)
     print(json.dumps(output or {}))
 
 

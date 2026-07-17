@@ -239,25 +239,66 @@ Shared state (used by both Claude Code and Codex plugins):
 ~/.cognee-plugin/venv/            # shared Cognee virtualenv
 ```
 
-## Update or remove
+## Updating
 
-Reinstall the plugin to pick up marketplace updates (run inside Claude Code chat):
+The plugin is versioned with [semver](https://semver.org/) — see
+[`CHANGELOG.md`](./CHANGELOG.md). Claude Code offers an update only when the
+plugin's `version` changes (it's pinned in the marketplace entry), so a plain
+reinstall of the same version reuses the cached copy.
+
+**Update on demand:**
+
+```
+/plugin marketplace update cognee     # refresh the marketplace catalog
+/plugin update cognee-memory@cognee   # apply a newer version if one exists
+```
+
+`/plugin update` reports "already at the latest version" when your installed
+version matches the published one.
+
+**Automatic updates (recommended):** Claude Code can refresh marketplaces and
+update installed plugins in the background after startup, then prompt you to run
+`/reload-plugins`. Auto-update is **enabled by default only for official
+Anthropic marketplaces** — for the third-party `cognee` marketplace you must opt
+in via Claude Code's per-marketplace auto-update setting (see the "Configure
+auto-updates" section of the Claude Code plugin docs). With it on, new releases
+land without any manual `/plugin update`.
+
+**If updates still don't appear**, re-add the marketplace source and reinstall:
 
 ```
 /plugin uninstall cognee-memory@cognee
-/plugin install cognee-memory@cognee
-```
-
-To also refresh the marketplace source:
-
-```
-/plugin uninstall cognee-memory@cognee
-/plugin marketplace remove topoteretes/cognee-integrations
+/plugin marketplace remove cognee
 /plugin marketplace add topoteretes/cognee-integrations
 /plugin install cognee-memory@cognee
 ```
 
-There is no automatic update mechanism — reinstall is the only way to pull in new plugin versions.
+### Update notifications
+
+When a newer version is published, the plugin surfaces it automatically — no
+configuration needed to receive them:
+
+- **Status line:** an amber `⬆ Cognee update available <installed>→<latest>`
+  segment appears, and disappears once you update.
+- **SessionStart:** a one-time message per new version, e.g. *"Cognee update
+  available 1.0.0 → 1.2.0 — run `/plugin update cognee-memory@cognee`."*
+
+A background check in the idle watcher runs **at most once per day** and fetches a
+single public file — the marketplace manifest on the tracked git ref, via
+`raw.githubusercontent.com` — to read the published version. It sends no data and
+no telemetry, uses a conditional (ETag) request, fails silently when offline, and
+skips local-path (dev) installs. Turn it off with `COGNEE_UPDATE_CHECK=false`.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `COGNEE_UPDATE_CHECK` | `true` | Background "update available" check + status-line/SessionStart nudges |
+| `COGNEE_UPDATE_CHECK_INTERVAL` | `86400` | Minimum seconds between checks |
+
+## Remove
+
+```
+/plugin uninstall cognee-memory@cognee
+```
 
 ## Troubleshooting
 

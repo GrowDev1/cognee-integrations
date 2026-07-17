@@ -20,6 +20,7 @@ _SHARED_ROOT = Path.home() / ".cognee-plugin"
 _CONFIG_PATH = _SHARED_ROOT / "config.json"
 _SERVER_READY_PATH = _SHARED_ROOT / "server-ready.json"
 _BREAKER_PATH = _SHARED_ROOT / "recall-breaker.json"
+_UPDATE_CHECK_PATH = _SHARED_ROOT / "codex" / "update-check.json"
 _DEFAULT_DATASET = "agent_sessions"
 
 
@@ -64,9 +65,31 @@ def _health_prefix() -> str:
     return ""
 
 
+def _update_segment() -> str:
+    """Plain-text 'update available' segment, or '' — read purely from the marker.
+
+    Codex surfaces status inside the model's context (not a terminal bar), so this
+    stays plain text (no ANSI). The idle watcher's background check writes the
+    marker; this remains network-free and free of any ``_plugin_common`` import.
+    """
+    if os.environ.get("COGNEE_UPDATE_CHECK", "").strip().lower() in ("0", "false", "no", "off"):
+        return ""
+    try:
+        marker = json.loads(_UPDATE_CHECK_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not (isinstance(marker, dict) and marker.get("update_available")):
+        return ""
+    installed = str(marker.get("installed_version") or "")
+    latest = str(marker.get("latest_version") or "")
+    if not (installed and latest):
+        return ""
+    return f"  ⬆ Cognee update available {installed}→{latest}"
+
+
 def render_status_for_host(host_id: str) -> str:
     """Return the status string (host_id is unused; kept for call-site compat)."""
-    return f"{_health_prefix()}cognee: {_active_dataset()} · {_active_mode()}"
+    return f"{_health_prefix()}cognee: {_active_dataset()} · {_active_mode()}{_update_segment()}"
 
 
 def main() -> None:
@@ -74,7 +97,9 @@ def main() -> None:
         json.load(sys.stdin)  # consume stdin as required by the host
     except Exception:
         pass
-    sys.stdout.write(f"{_health_prefix()}cognee: {_active_dataset()} · {_active_mode()}")
+    sys.stdout.write(
+        f"{_health_prefix()}cognee: {_active_dataset()} · {_active_mode()}{_update_segment()}"
+    )
 
 
 if __name__ == "__main__":
