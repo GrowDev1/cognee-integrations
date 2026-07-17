@@ -34,6 +34,7 @@ from _plugin_common import (
     _VENV_DIR,
     _VENV_PYTHON,
     _VENV_READY_MARKER,
+    _https_context,
     _reexec_into_venv,
     apply_cognee_env,
     ensure_launch_record,
@@ -48,6 +49,7 @@ from _plugin_common import (
     touch_activity,
 )
 from config import (
+    _cloud_http_request,
     _user_id_via_api,
     ensure_cognee_ready,
     ensure_dataset_ready,
@@ -364,7 +366,7 @@ def _health_url(service_url: str) -> str:
 
 def _health_ok(url: str = _HEALTH_URL, timeout: float = 2.0) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(url, timeout=timeout, context=_https_context()) as response:
             return response.status == 200
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
@@ -529,57 +531,54 @@ def _normalize_service_url(service_url: str) -> str:
 
 
 async def _login_default_user_for_owner_api_key(service_url: str, config: dict) -> str:
-    import aiohttp
-
     base = _normalize_service_url(service_url)
     email = config.get("user_email", "")
     password = config.get("user_password", "")
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{base}/api/v1/auth/login",
-            data={"username": email, "password": password},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(
-                    "default-user login failed "
-                    f"({resp.status}: {body[:200]}). "
-                    "Set COGNEE_USER_EMAIL/COGNEE_USER_PASSWORD correctly."
-                )
-            login_data = await resp.json()
-            jwt = str(login_data.get("access_token", "") or "")
+    status, body = _cloud_http_request(
+        f"{base}/api/v1/auth/login",
+        method="POST",
+        form_body={"username": email, "password": password},
+        timeout=30.0,
+    )
+    if status != 200:
+        raise RuntimeError(
+            "default-user login failed "
+            f"({status}: {body[:200]}). "
+            "Set COGNEE_USER_EMAIL/COGNEE_USER_PASSWORD correctly."
+        )
+    login_data = json.loads(body) if body else {}
+    jwt = str(login_data.get("access_token", "") or "")
+    if not jwt:
+        raise RuntimeError("default-user login returned no access token")
 
-        if not jwt:
-            raise RuntimeError("default-user login returned no access token")
+    status, body = _cloud_http_request(
+        f"{base}/api/v1/auth/api-keys",
+        method="GET",
+        cookies={"auth_token": jwt},
+        timeout=30.0,
+    )
+    if status == 200:
+        keys = json.loads(body) if body else []
+        if isinstance(keys, list) and keys:
+            key = str(keys[0].get("key", "") or "")
+            if key:
+                return key
 
-        async with session.get(
-            f"{base}/api/v1/auth/api-keys",
-            cookies={"auth_token": jwt},
-        ) as resp:
-            if resp.status == 200:
-                keys = await resp.json()
-                if isinstance(keys, list) and keys:
-                    key = str(keys[0].get("key", "") or "")
-                    if key:
-                        return key
-
-        async with session.post(
-            f"{base}/api/v1/auth/api-keys",
-            json={"name": "claude-owner-bootstrap"},
-            cookies={"auth_token": jwt},
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(
-                    f"default-user API key creation failed ({resp.status}: {body[:200]})"
-                )
-            payload = await resp.json()
-            key = str(payload.get("key", "") or "")
-            if not key:
-                raise RuntimeError("default-user API key creation returned empty key")
-            return key
+    status, body = _cloud_http_request(
+        f"{base}/api/v1/auth/api-keys",
+        method="POST",
+        json_body={"name": "claude-owner-bootstrap"},
+        cookies={"auth_token": jwt},
+        timeout=30.0,
+    )
+    if status != 200:
+        raise RuntimeError(f"default-user API key creation failed ({status}: {body[:200]})")
+    payload = json.loads(body) if body else {}
+    key = str(payload.get("key", "") or "")
+    if not key:
+        raise RuntimeError("default-user API key creation returned empty key")
+    return key
 
 
 def _resolve_agent_name(config: dict, cwd: str) -> str:
@@ -1187,7 +1186,14 @@ def _ensure_statusline_configured() -> None:
         return
 
     settings_path = Path.home() / ".claude" / "settings.json"
-    desired = {"type": "command", "command": str(statusline_sh)}
+    # Guard on the script's existence at run time. Claude Code does not remove
+    # this statusLine entry when the plugin is uninstalled, and the command runs
+    # through a shell — so if the plugin's files are later purged from the cache,
+    # a bare path would fail on every refresh. The `[ -x ] && exec … || true`
+    # guard degrades to a clean, empty status line instead. (When the files
+    # linger but the plugin is disabled, the renderer self-evicts this entry.)
+    guarded_command = f'[ -x "{statusline_sh}" ] && exec "{statusline_sh}" || true'
+    desired = {"type": "command", "command": guarded_command}
 
     try:
         settings: dict = {}
