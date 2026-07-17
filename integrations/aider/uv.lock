@@ -777,7 +777,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cognee", specifier = ">=0.4.0" },
+    { name = "cognee", specifier = ">=0.4.0,<2.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
 ]
 
