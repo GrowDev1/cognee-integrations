@@ -249,7 +249,7 @@ def _create_map_record_if_absent(host_key: str, record: dict) -> dict:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(record, fh, indent=2, sort_keys=True)
         return record
-    except FileExistsError:
+    except (FileExistsError, PermissionError):
         return _read_map_record(host_key) or record
     except Exception as exc:
         hook_log("map_create_failed", {"error": str(exc)[:200]})
@@ -630,7 +630,7 @@ def _buffer_lock():
             os.close(fd)
             acquired = True
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             if time.monotonic() >= deadline:
                 hook_log("buffer_lock_timeout", {})
                 break
@@ -1047,7 +1047,7 @@ def sync_lock(owner: str):
                 json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
             acquired = True
             yield True
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             hook_log("sync_lock_busy", {"owner": owner})
             yield False
     finally:
@@ -1352,7 +1352,7 @@ def _healer_claim_mutex(timeout: float = 2.0):
                 os.close(fd)
                 acquired = True
                 break
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 try:
                     if time.time() - _HEALER_CLAIM_LOCK.stat().st_mtime > 5.0:
                         _HEALER_CLAIM_LOCK.unlink()  # abandoned by a crashed holder -- reclaim
@@ -1451,7 +1451,7 @@ def _claim_healer_cooldown_locked(now: float) -> bool:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"ts": now, "pid": 0}, fh)
         return True
-    except FileExistsError:
+    except (FileExistsError, PermissionError):
         return False
     except Exception:
         return False
@@ -2110,7 +2110,7 @@ def _try_acquire_drain_lock() -> bool:
         fd = os.open(str(_DRAIN_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.close(fd)
         return True
-    except FileExistsError:
+    except (FileExistsError, PermissionError):
         return False
     except Exception as exc:
         # Fail open: a rare double replay (deduped server-side per entry write)

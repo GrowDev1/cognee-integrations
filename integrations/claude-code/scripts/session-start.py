@@ -268,7 +268,7 @@ def ensure_cognee_installed(timeout: float = _INSTALL_TIMEOUT_SECONDS) -> bool:
                     json.dump({"owner": owner, "pid": os.getpid(), "created_at": now}, fh)
                 acquired = True
                 break
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 # Another process owns the install. Don't install concurrently —
                 # wait for it to produce a usable venv, then reuse it.
                 if _venv_cognee_version() == _PINNED_COGNEE_VERSION:
@@ -476,7 +476,7 @@ def _ensure_local_server_running(
                 acquired = True
                 hook_log("server_bootstrap_lock_acquired", {"owner": owner})
                 break
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 if _health_ok(health_url):
                     _ready()
                     return
@@ -946,7 +946,7 @@ def _bootstrap_singleflight():
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"pid": os.getpid(), "created_at": now}, fh)
             acquired = True
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             acquired = False
         yield acquired
     finally:
