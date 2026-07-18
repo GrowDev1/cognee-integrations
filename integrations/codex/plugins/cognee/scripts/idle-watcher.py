@@ -154,6 +154,17 @@ async def _improve_once(session_id: str, dataset: str, config: dict) -> bool:
             return False
 
 
+def _run_update_check() -> None:
+    """Fire the background, daily-guarded plugin update check (best-effort)."""
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from _plugin_common import maybe_check_for_update  # type: ignore
+
+        maybe_check_for_update()
+    except Exception as exc:
+        _log("update_check_error", error=str(exc)[:200])
+
+
 async def _main_loop(session_id: str, dataset: str, config: dict) -> None:
     _log(
         "started",
@@ -163,6 +174,9 @@ async def _main_loop(session_id: str, dataset: str, config: dict) -> None:
         poll=POLL_SECONDS,
         idle=IDLE_SECONDS,
     )
+    # Runs once per watcher launch (≈ once per session); the check itself is
+    # internally rate-limited to ≤ once per COGNEE_UPDATE_CHECK_INTERVAL.
+    _run_update_check()
     last_improved_at = 0.0
     exit_reason = "loop_complete"
     bridge_disabled = False

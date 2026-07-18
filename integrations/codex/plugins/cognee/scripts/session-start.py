@@ -1211,9 +1211,39 @@ async def _start(payload: dict | None = None) -> dict:
     return {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": status_line,
+            "additionalContext": status_line + _update_nudge_suffix(),
         },
     }
+
+
+def _update_nudge_suffix() -> str:
+    """One-time 'update available' line appended to SessionStart context.
+
+    Reads the marker written by the idle watcher's background check (no network),
+    shown once per newly-detected version (tracked via ``notified_version``). The
+    per-turn in-context status (render_status_for_host) carries the short ambient
+    segment; this is the actionable one-shot nudge with the update command.
+    """
+    try:
+        from _plugin_common import mark_update_notified, read_update_status
+
+        status = read_update_status()
+    except Exception:
+        return ""
+    if not status:
+        return ""
+    installed = str(status.get("installed_version") or "")
+    latest = str(status.get("latest_version") or "")
+    if not (installed and latest) or status.get("notified_version") == latest:
+        return ""
+    try:
+        mark_update_notified(latest)
+    except Exception:
+        pass
+    return (
+        f"\n\nCognee update available {installed} → {latest} — run "
+        "`codex plugin marketplace upgrade cognee` to update."
+    )
 
 
 def main():
