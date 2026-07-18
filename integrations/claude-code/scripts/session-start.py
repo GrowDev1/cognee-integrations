@@ -27,10 +27,12 @@ from pathlib import Path
 # Add scripts dir to path for config import
 sys.path.insert(0, os.path.dirname(__file__))
 from _plugin_common import (
+    _claim_healer_cooldown,
     _COGNEE_CACHE_DIR,
     _COGNEE_DATA_DIR,
     _COGNEE_SYSTEM_DIR,
     _parse_host_port,
+    _stamp_healer_spawn_pid,
     _VENV_DIR,
     _VENV_PYTHON,
     _VENV_READY_MARKER,
@@ -935,7 +937,26 @@ def _spawn_bootstrap(
     session_key: str,
     dataset: str,
 ) -> None:
-    """Launch the detached server-bootstrap worker (this script, --bootstrap)."""
+    """Launch the detached server-bootstrap worker (this script, --bootstrap).
+
+    Gated on the SAME shared PID-liveness marker spawn_server_healer() uses in
+    _plugin_common.py (2026-07-17/18 fix): this and the healer are two independent
+    entry points into the identical worker class, both racing to boot the same local
+    server. Before this fix, each was rate-limited only against ITSELF (a 30s cooldown
+    with no cross-entry-point awareness) -- many concurrent SessionStarts (or a
+    SessionStart racing an already-in-flight healer spawn) could each independently
+    decide the coast was clear and spawn their own detached worker, every one of which
+    then blocks for up to _SERVER_BOOT_DEADLINE_SECONDS (600s) waiting for /health.
+    That is exactly the stacking pattern that produced ~27 orphaned processes during
+    the 2026-07-17/18 outage. A skipped spawn here is not a lost boot attempt: the
+    already-in-flight worker's own _bootstrap_singleflight (or a peer's) still owns
+    getting the server up, and this caller's session proceeds exactly as the
+    single-flight LOSERS already do inside _run_bootstrap -- it just doesn't ALSO
+    spawn a redundant worker process of its own.
+    """
+    if not _claim_healer_cooldown(time.time()):
+        hook_log("bootstrap_spawn_skipped_inflight", {"session_id": session_id})
+        return
     bootstrap = {
         "cwd": cwd,
         "session_id": session_id,
@@ -955,7 +976,7 @@ def _spawn_bootstrap(
         env = os.environ.copy()
         if session_key:
             env["COGNEE_SESSION_KEY"] = session_key
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), _BOOTSTRAP_ARG, json.dumps(bootstrap)],
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
@@ -964,7 +985,10 @@ def _spawn_bootstrap(
             start_new_session=True,
             close_fds=True,
         )
-        hook_log("bootstrap_spawned", {"session_id": session_id})
+        # Same shared marker spawn_server_healer() stamps -- see this function's own
+        # docstring for why these two entry points share one in-flight record.
+        _stamp_healer_spawn_pid(proc.pid)
+        hook_log("bootstrap_spawned", {"session_id": session_id, "pid": proc.pid})
     except Exception as exc:
         hook_log("bootstrap_spawn_failed", {"error": str(exc)[:300]})
 

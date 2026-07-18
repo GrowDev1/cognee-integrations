@@ -246,6 +246,186 @@ def test_cooldown_claim_is_atomic_not_read_then_write():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── 2026-07-17/18 fix: inflight-worker gating (the retry-cascade bug) ──────────
+
+
+def test_inflight_worker_blocks_a_new_spawn_even_after_cooldown_expires():
+    # The exact incident this fixes: the old cooldown (elapsed-time only) let a new
+    # spawn through the moment the SHORT cooldown expired, even while a PREVIOUS
+    # worker was still genuinely alive and inside its own much-longer wait-for-health
+    # window -- causing spawns to stack for hours against a server that could never
+    # become healthy. A worker that's still alive must block a new spawn even once
+    # the plain cooldown has elapsed.
+    tmp = _tmp_dir()
+    dummy = tmp / "dummy_session_start.py"
+    dummy.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+    orig_script = pc._SESSION_START_SCRIPT
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    orig_log = pc._HEALER_LOG
+    orig_cooldown = pc._HEALER_SPAWN_COOLDOWN_SECONDS
+    orig_stale = pc._HEALER_INFLIGHT_STALE_SECONDS
+    proc_to_cleanup = None
+    try:
+        pc._SESSION_START_SCRIPT = dummy
+        pc._HEALER_SPAWN_MARKER = tmp / "healer-spawned.json"
+        pc._HEALER_LOG = tmp / "healer.log"
+        pc._HEALER_SPAWN_COOLDOWN_SECONDS = 0.2  # short, so it expires well before the worker exits
+        pc._HEALER_INFLIGHT_STALE_SECONDS = 30.0  # long, so staleness doesn't mask this
+
+        first = pc.spawn_server_healer(cwd=str(tmp))
+        assert first is True
+        marker = json.loads(pc._HEALER_SPAWN_MARKER.read_text(encoding="utf-8"))
+        proc_to_cleanup = marker.get("pid")
+
+        time.sleep(0.4)  # cooldown (0.2s) has now expired, but the dummy worker sleeps 5s
+        second = pc.spawn_server_healer(cwd=str(tmp))
+        assert second is False, "a new spawn must be blocked while the previous worker is still alive"
+    finally:
+        pc._SESSION_START_SCRIPT = orig_script
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        pc._HEALER_LOG = orig_log
+        pc._HEALER_SPAWN_COOLDOWN_SECONDS = orig_cooldown
+        pc._HEALER_INFLIGHT_STALE_SECONDS = orig_stale
+        if proc_to_cleanup:
+            try:
+                os.kill(int(proc_to_cleanup), 9)
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_inflight_check_unblocks_immediately_once_worker_exits():
+    # Crash-safety requirement: if the spawned worker dies/exits EARLY (crash, or in
+    # this test's case a script that exits fast), a new spawn must be allowed right
+    # away -- not blocked for the rest of the (possibly very long) deadline window.
+    tmp = _tmp_dir()
+    dummy = tmp / "dummy_session_start.py"
+    dummy.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")  # exits ~immediately
+    orig_script = pc._SESSION_START_SCRIPT
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    orig_log = pc._HEALER_LOG
+    orig_cooldown = pc._HEALER_SPAWN_COOLDOWN_SECONDS
+    orig_stale = pc._HEALER_INFLIGHT_STALE_SECONDS
+    try:
+        pc._SESSION_START_SCRIPT = dummy
+        pc._HEALER_SPAWN_MARKER = tmp / "healer-spawned.json"
+        pc._HEALER_LOG = tmp / "healer.log"
+        pc._HEALER_SPAWN_COOLDOWN_SECONDS = 0.05
+        pc._HEALER_INFLIGHT_STALE_SECONDS = 300.0  # long -- must NOT be why the second call succeeds
+
+        first = pc.spawn_server_healer(cwd=str(tmp))
+        assert first is True
+        time.sleep(0.3)  # let the dummy process actually exit, and let the short cooldown pass
+        second = pc.spawn_server_healer(cwd=str(tmp))
+        assert second is True, "a dead worker's PID must not block a new spawn, regardless of the stale-window setting"
+    finally:
+        pc._SESSION_START_SCRIPT = orig_script
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        pc._HEALER_LOG = orig_log
+        pc._HEALER_SPAWN_COOLDOWN_SECONDS = orig_cooldown
+        pc._HEALER_INFLIGHT_STALE_SECONDS = orig_stale
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_healer_worker_inflight_treats_missing_pid_field_as_not_inflight():
+    # Backward compatibility: a marker written by pre-fix code (or by the placeholder
+    # write inside _claim_healer_cooldown itself) has pid=0 / no pid -- must never be
+    # treated as "something is inflight", or the very first claim would deadlock.
+    tmp = _tmp_dir()
+    marker = tmp / "healer-spawned.json"
+    marker.write_text(json.dumps({"ts": time.time()}), encoding="utf-8")  # no "pid" key at all
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    try:
+        pc._HEALER_SPAWN_MARKER = marker
+        assert pc._healer_worker_inflight(time.time()) is False
+    finally:
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_healer_worker_inflight_ignores_a_marker_past_the_stale_window():
+    # Even if the recorded pid happened to still resolve to a live (unrelated,
+    # PID-reused) process, a marker older than _HEALER_INFLIGHT_STALE_SECONDS must
+    # never block forever -- age is an unconditional escape hatch.
+    tmp = _tmp_dir()
+    marker = tmp / "healer-spawned.json"
+    # Use THIS test process's own pid -- guaranteed alive -- to isolate the age check
+    # from any pid-liveness variable.
+    marker.write_text(json.dumps({"ts": time.time() - 999999, "pid": os.getpid()}), encoding="utf-8")
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    orig_stale = pc._HEALER_INFLIGHT_STALE_SECONDS
+    try:
+        pc._HEALER_SPAWN_MARKER = marker
+        pc._HEALER_INFLIGHT_STALE_SECONDS = 300.0
+        assert pc._healer_worker_inflight(time.time()) is False
+    finally:
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        pc._HEALER_INFLIGHT_STALE_SECONDS = orig_stale
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_healer_worker_inflight_true_for_a_live_recent_pid():
+    tmp = _tmp_dir()
+    marker = tmp / "healer-spawned.json"
+    marker.write_text(json.dumps({"ts": time.time(), "pid": os.getpid()}), encoding="utf-8")
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    try:
+        pc._HEALER_SPAWN_MARKER = marker
+        assert pc._healer_worker_inflight(time.time()) is True
+    finally:
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_corrupt_marker_self_heals_instead_of_permanently_deadlocking():
+    # 2026-07-18 adversarial-test finding: a marker that EXISTS but contains unparseable JSON
+    # (e.g. a torn write from a process killed mid-write during the exclusive-create claim
+    # path) used to fall into `_claim_healer_cooldown`'s generic `except Exception: return
+    # False` -- which never repairs the file, so EVERY future call hits the identical
+    # exception forever. That would permanently disable the self-healing mechanism this
+    # whole fix exists to provide, until a human manually deletes the marker -- exactly the
+    # class of silent, permanent regression the fix itself was built to prevent. Reproduced
+    # live against the actually-deployed plugin-cache copy before this test was written.
+    tmp = _tmp_dir()
+    marker = tmp / "healer-spawned.json"
+    marker.write_text('{"pid": 123, "ts": ', encoding="utf-8")  # deliberately truncated JSON
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    try:
+        pc._HEALER_SPAWN_MARKER = marker
+        now = time.time()
+        claimed = pc._claim_healer_cooldown(now)
+        assert claimed is True, "a corrupt marker must be repaired and claimed, not permanently refused"
+        # The marker must now be valid JSON with a fresh timestamp -- confirms it was actually
+        # repaired on disk, not just that the function happened to return True this once.
+        repaired = json.loads(marker.read_text(encoding="utf-8"))
+        assert repaired["pid"] == 0
+        assert abs(repaired["ts"] - now) < 5
+        # And a second call afterward must behave normally (respect the cooldown), proving
+        # this isn't a one-shot fluke -- the repair actually restored steady-state behavior.
+        assert pc._claim_healer_cooldown(time.time()) is False
+    finally:
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_corrupt_marker_with_wrong_json_shape_also_self_heals():
+    # A different corruption shape: syntactically valid JSON that isn't the expected dict
+    # (e.g. `null`, from a write that only got as far as flushing an empty/placeholder value).
+    # `raw.get(...)` on a non-dict raises AttributeError, not JSONDecodeError -- must be
+    # caught by the same repair path, not slip through to the permanent-deadlock branch.
+    tmp = _tmp_dir()
+    marker = tmp / "healer-spawned.json"
+    marker.write_text("null", encoding="utf-8")
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    try:
+        pc._HEALER_SPAWN_MARKER = marker
+        assert pc._claim_healer_cooldown(time.time()) is True
+        assert json.loads(marker.read_text(encoding="utf-8"))["pid"] == 0
+    finally:
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     failures = 0
     for _name, _fn in sorted(globals().items()):

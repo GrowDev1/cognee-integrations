@@ -39,6 +39,19 @@ _SESSION_START_SCRIPT = Path(__file__).resolve().parent / "session-start.py"
 _HEALER_SPAWN_MARKER = _SHARED_PLUGIN_ROOT / "healer-spawned.json"
 _HEALER_LOG = _SHARED_PLUGIN_ROOT / "healer.log"
 _HEALER_SPAWN_COOLDOWN_SECONDS = 30.0
+# 2026-07-17/18 incident fix: a spawned bootstrap worker can legitimately block for up
+# to _HEALER_BOOT_DEADLINE_SECONDS waiting for the server to become healthy (mirrors
+# session-start.py's own COGNEE_SERVER_BOOT_DEADLINE / _SERVER_BOOT_DEADLINE_SECONDS --
+# duplicated here rather than imported, since this module is invoked as a detached
+# subprocess and deliberately never imports session-start.py; sourcing both from the
+# same env var keeps them from silently drifting apart). The old cooldown alone (30s)
+# was far shorter than that 600s wait, so when the server could genuinely never become
+# healthy (e.g. a permanently-locked graph DB), new healer spawns kept stacking on top
+# of still-waiting old ones every ~30s-2min for hours -- confirmed live, ~27 zombie
+# processes over 9 hours. _healer_worker_inflight() below closes this by tracking the
+# spawned worker's PID, not just elapsed time.
+_HEALER_BOOT_DEADLINE_SECONDS = float(os.environ.get("COGNEE_SERVER_BOOT_DEADLINE", "") or 600.0)
+_HEALER_INFLIGHT_STALE_SECONDS = _HEALER_BOOT_DEADLINE_SECONDS + 60.0
 _SYNC_LOCK = _PLUGIN_DIR / "sync.lock"
 # Per-agent-session buffer dirs. Each agent session (one Claude/Codex terminal)
 # owns its own file under these dirs, so two concurrent agents never
@@ -1229,6 +1242,50 @@ def is_local_url(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
 
 
+def _pid_alive(pid: int) -> bool:
+    """Duplicated from session-start.py's own _pid_alive (not imported -- this module
+    is invoked as a detached subprocess and deliberately never imports session-start.py,
+    same reasoning as the deadline constants above)."""
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _healer_worker_inflight(now: float) -> bool:
+    """True iff a previously-spawned bootstrap worker is still plausibly inside its own
+    wait-for-health window -- the fix for the 2026-07-17/18 cascade. Checking PID
+    liveness, not just elapsed time, means a worker that crashes/exits early does NOT
+    block new attempts for the rest of the deadline window: _pid_alive returns False
+    immediately once it's gone, so the very next caller is allowed through."""
+    try:
+        raw = json.loads(_HEALER_SPAWN_MARKER.read_text(encoding="utf-8"))
+        pid = int(raw.get("pid", 0) or 0)
+        ts = float(raw.get("ts", 0) or 0)
+    except Exception:
+        # 2026-07-18 adversarial-test finding: this used to wrap ONLY the json.loads call,
+        # so a syntactically-valid-but-wrong-shape marker (e.g. literal `null`, from a write
+        # that only got as far as flushing a placeholder) raised an UNCAUGHT AttributeError
+        # out of raw.get(...) below -- crashing whatever caller invoked this (a SessionStart
+        # hook, or a mid-session healer trigger), not just failing to detect an inflight
+        # worker. Wrapping the extraction in the same try/except that already covers the
+        # parse means any corrupt/malformed marker fails safe (not-inflight) instead of
+        # propagating an exception into the caller.
+        return False
+    if pid <= 0:
+        return False  # marker predates this fix, or was never stamped -- not in-flight
+    if now - ts > _HEALER_INFLIGHT_STALE_SECONDS:
+        return False  # older than any legitimate wait-for-health window -- abandoned
+    return _pid_alive(pid)
+
+
 def _claim_healer_cooldown(now: float) -> bool:
     """Atomically claim the cooldown window: True iff this call may proceed to
     spawn a healer. Uses exclusive file creation (O_CREAT|O_EXCL), the same
@@ -1237,11 +1294,20 @@ def _claim_healer_cooldown(now: float) -> bool:
     write check, which is a TOCTOU race: two callers (e.g. Claude + Codex
     sharing one server, or two terminals) that both read the marker before
     either writes it back can both fall through and both spawn a healer.
+
+    Also checked here (2026-07-17/18 fix): _healer_worker_inflight -- a previous
+    spawn's worker still genuinely alive and inside its own boot-deadline window
+    blocks a new spawn regardless of the (much shorter) cooldown elapsing, since the
+    cooldown alone let new attempts stack on top of still-waiting old ones for hours
+    when the server could never become healthy. This check runs BEFORE the cooldown
+    check so it can refuse even once the plain elapsed-time cooldown has expired.
     """
     try:
         _HEALER_SPAWN_MARKER.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+    if _healer_worker_inflight(now):
+        return False
     try:
         raw = json.loads(_HEALER_SPAWN_MARKER.read_text(encoding="utf-8"))
         last = float(raw.get("ts", 0) or 0)
@@ -1251,12 +1317,32 @@ def _claim_healer_cooldown(now: float) -> bool:
         # os.replace, not exclusive-create, since we've established we're the
         # rightful next claimant -- a competing claimant racing THIS exact
         # instant would at worst cause one extra spawn, not corruption).
+        # pid=0 is a placeholder -- spawn_server_healer() stamps the real PID
+        # once Popen returns, since it isn't known at claim time.
         tmp = _HEALER_SPAWN_MARKER.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"ts": now}), encoding="utf-8")
+        tmp.write_text(json.dumps({"ts": now, "pid": 0}), encoding="utf-8")
         os.replace(tmp, _HEALER_SPAWN_MARKER)
         return True
     except FileNotFoundError:
         pass
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
+        # Marker EXISTS but is corrupt/unparseable (e.g. a torn write from a process killed
+        # mid-write during the exclusive-create branch below, before json.dump finished) --
+        # 2026-07-18 adversarial-test finding: treating this the same as the generic
+        # `except Exception: return False` below permanently deadlocked every future claim,
+        # since the exclusive-create fallback further down also can't repair it (O_CREAT|
+        # O_EXCL fails outright because the corrupt file already exists). Repair it the same
+        # way the "cooldown expired" branch above does -- os.replace works regardless of the
+        # target's current content, unlike O_CREAT|O_EXCL. _healer_worker_inflight already
+        # ran (and returned False on this same corrupt marker) before this function reached
+        # here, so there is no live-PID signal being discarded by treating this as claimable.
+        try:
+            tmp = _HEALER_SPAWN_MARKER.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"ts": now, "pid": 0}), encoding="utf-8")
+            os.replace(tmp, _HEALER_SPAWN_MARKER)
+            return True
+        except Exception:
+            return False
     except Exception:
         return False
     # No marker exists yet: exclusive-create is the atomic "first one here wins"
@@ -1265,12 +1351,31 @@ def _claim_healer_cooldown(now: float) -> bool:
     try:
         fd = os.open(str(_HEALER_SPAWN_MARKER), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"ts": now}, fh)
+            json.dump({"ts": now, "pid": 0}, fh)
         return True
     except FileExistsError:
         return False
     except Exception:
         return False
+
+
+def _stamp_healer_spawn_pid(pid: int) -> None:
+    """Stamp a just-spawned worker's real PID into _HEALER_SPAWN_MARKER, atomically
+    (temp file + os.replace). Shared by every entry point that spawns this worker class
+    (spawn_server_healer here, and session-start.py's own _spawn_bootstrap) so
+    _healer_worker_inflight() sees ONE consistent in-flight record regardless of which
+    entry point actually fired -- a healer-triggered spawn and a fresh-SessionStart
+    spawn compete for the same underlying resource (booting the local server) and must
+    not be able to stack independently of each other. Best-effort: if this write fails,
+    the next caller under-protects for one cooldown window (falls back to the old
+    elapsed-time-only behavior), never over-protects.
+    """
+    try:
+        tmp = _HEALER_SPAWN_MARKER.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"ts": time.time(), "pid": pid}), encoding="utf-8")
+        os.replace(tmp, _HEALER_SPAWN_MARKER)
+    except Exception:
+        pass
 
 
 def spawn_server_healer(cwd: str = "") -> bool:
@@ -1326,7 +1431,7 @@ def spawn_server_healer(cwd: str = "") -> bool:
             log_fh = _HEALER_LOG.open("a", encoding="utf-8")
         except Exception:
             log_fh = subprocess.DEVNULL
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, str(_SESSION_START_SCRIPT), "--bootstrap", json.dumps(payload)],
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
@@ -1334,7 +1439,12 @@ def spawn_server_healer(cwd: str = "") -> bool:
             start_new_session=True,
             close_fds=True,
         )
-        hook_log("server_healer_spawned", {"cwd": payload["cwd"]})
+        # Stamp the real PID into the cooldown marker now that we have it (the claim
+        # above wrote a pid=0 placeholder, since the PID isn't known until Popen
+        # returns) -- this is what lets _healer_worker_inflight() track this specific
+        # worker's liveness on the NEXT call, not just elapsed time.
+        _stamp_healer_spawn_pid(proc.pid)
+        hook_log("server_healer_spawned", {"cwd": payload["cwd"], "pid": proc.pid})
         return True
     except Exception as exc:
         hook_log("server_healer_spawn_failed", {"error": str(exc)[:200]})
