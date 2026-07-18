@@ -515,8 +515,41 @@ def _ensure_local_server_running(
 
 
 def _pid_alive(pid: int) -> bool:
+    """2026-07-18 adversarial-test finding (CRITICAL): on Windows, os.kill(pid, 0) does NOT
+    behave as a liveness probe -- signal 0 maps to CTRL_C_EVENT there, so it goes through
+    GenerateConsoleCtrlEvent rather than validating the PID refers to a live process.
+    Confirmed via 15/15 controlled trials that a definitively-dead PID still reports alive.
+    See _plugin_common.py's own copy of this function for the full writeup -- kept
+    duplicated here (not imported) for the same reason as elsewhere in this file: some
+    callers of this function run in a detached/isolated subprocess context."""
     if pid <= 1:
         return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        except Exception:
+            return False
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        except Exception:
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -787,19 +820,14 @@ def _spawn_exit_watcher(
     service_url: str = "",
 ) -> None:
     """Launch a detached watcher that syncs only after Claude exits."""
-
-    def _pid_alive(pid: int) -> bool:
-        if pid <= 1:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except Exception:
-            return False
+    # 2026-07-18: this used to redefine its own local _pid_alive, byte-identical to (and
+    # sharing the same Windows liveness bug as) the module-level one above -- removed so
+    # both call sites below resolve to the single, now-fixed module-level function instead
+    # of a second copy that would need the same fix applied twice. This closure's own bug
+    # had a concrete real-world consequence: stale exit-watcher pidfiles were never pruned
+    # (line ~810 below), and a genuinely-dead prior watcher's pidfile made this function
+    # believe a watcher was "already running" and skip spawning a new one -- silently
+    # breaking exit-sync for that session until the stale pidfile was removed by hand.
 
     # Cleanup stale watcher pidfiles so the directory does not grow forever.
     try:

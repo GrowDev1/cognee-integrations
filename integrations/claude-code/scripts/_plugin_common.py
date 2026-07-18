@@ -1245,9 +1245,51 @@ def is_local_url(url: str) -> bool:
 def _pid_alive(pid: int) -> bool:
     """Duplicated from session-start.py's own _pid_alive (not imported -- this module
     is invoked as a detached subprocess and deliberately never imports session-start.py,
-    same reasoning as the deadline constants above)."""
+    same reasoning as the deadline constants above).
+
+    2026-07-18 adversarial-test finding (CRITICAL): on Windows, ``os.kill(pid, 0)`` does
+    NOT behave as a liveness probe the way it does on POSIX. Signal 0 maps to
+    ``CTRL_C_EVENT`` on Windows, so the call goes through ``GenerateConsoleCtrlEvent``
+    rather than validating the PID refers to a live process -- confirmed via 15/15
+    controlled trials (spawn a real child, ``Popen.wait()`` to confirm it exited,
+    immediately check) that a definitively-dead PID is STILL reported alive; only a
+    syntactically-invalid PID raises. This silently made every PID-liveness check built
+    for tonight's retry-cascade fix nearly always report "still alive" for the full
+    ``_HEALER_INFLIGHT_STALE_SECONDS`` window regardless of the real worker's state --
+    the opposite of the intended fix. Use a real OS-level check on Windows instead:
+    ``OpenProcess`` + ``GetExitCodeProcess``, testing for ``STILL_ACTIVE`` (259) -- the
+    same category of fix already applied correctly in Layer 1's watchdog
+    (``cognee_db_workers/harness.py``), just applied here to a liveness POLL rather than
+    a blocking WAIT.
+    """
     if pid <= 1:
         return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        except Exception:
+            return False
+        if not handle:
+            return False  # no such process (or access denied -- treat as not-ours/not-alive)
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        except Exception:
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -1286,14 +1328,59 @@ def _healer_worker_inflight(now: float) -> bool:
     return _pid_alive(pid)
 
 
+_HEALER_CLAIM_LOCK = _SHARED_PLUGIN_ROOT / "healer-claim.lock"
+
+
+@contextmanager
+def _healer_claim_mutex(timeout: float = 2.0):
+    """Short-lived spinlock guarding _claim_healer_cooldown's read-decide-write critical
+    section. 2026-07-18 adversarial-test finding: the "marker exists, cooldown expired"
+    branch used to read the marker, decide to claim, and only later write its replacement
+    with NO lock between the two -- reproduced live with a threading.Barrier forcing two
+    concurrent callers to both observe "cooldown expired" and both write a winning claim,
+    exactly the duplicate-spawn stacking this whole fix exists to prevent. This lock is only
+    ever held for a handful of fast file operations (never real work), so a short spin-retry
+    with a short stale-takeover window is sufficient -- no need for the fuller staleness/pid-
+    tracking machinery session-start.py's own _bootstrap_lock uses for its own, much
+    longer-held lock (that one guards an actual uvicorn boot, up to 600s)."""
+    deadline = time.time() + timeout
+    acquired = False
+    try:
+        while True:
+            try:
+                fd = os.open(str(_HEALER_CLAIM_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - _HEALER_CLAIM_LOCK.stat().st_mtime > 5.0:
+                        _HEALER_CLAIM_LOCK.unlink()  # abandoned by a crashed holder -- reclaim
+                        continue
+                except Exception:
+                    pass
+                if time.time() > deadline:
+                    break
+                time.sleep(0.01)
+            except Exception:
+                break
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                _HEALER_CLAIM_LOCK.unlink()
+            except Exception:
+                pass
+
+
 def _claim_healer_cooldown(now: float) -> bool:
     """Atomically claim the cooldown window: True iff this call may proceed to
-    spawn a healer. Uses exclusive file creation (O_CREAT|O_EXCL), the same
-    primitive session-start.py's own _SERVER_BOOT_LOCK/_VENV_INSTALL_LOCK use
-    elsewhere in this codebase for single-flighting -- NOT a read-then-later-
-    write check, which is a TOCTOU race: two callers (e.g. Claude + Codex
-    sharing one server, or two terminals) that both read the marker before
-    either writes it back can both fall through and both spawn a healer.
+    spawn a healer. The whole read-decide-write critical section runs inside
+    _healer_claim_mutex (2026-07-18 fix) -- NOT a read-then-later-write check outside
+    any lock, which is a TOCTOU race: two callers (e.g. Claude + Codex sharing one
+    server, or two terminals, or spawn_server_healer racing session-start.py's own
+    _spawn_bootstrap) that both read the marker before either writes it back can both
+    fall through and both spawn a healer.
 
     Also checked here (2026-07-17/18 fix): _healer_worker_inflight -- a previous
     spawn's worker still genuinely alive and inside its own boot-deadline window
@@ -1308,6 +1395,17 @@ def _claim_healer_cooldown(now: float) -> bool:
         pass
     if _healer_worker_inflight(now):
         return False
+    with _healer_claim_mutex() as acquired:
+        if not acquired:
+            # Another caller has held the mutex for the full timeout -- treat this the
+            # same as "cooldown not yet expired" rather than risk a stale takeover mid-write.
+            return False
+        return _claim_healer_cooldown_locked(now)
+
+
+def _claim_healer_cooldown_locked(now: float) -> bool:
+    """The actual read-decide-write logic, always called with _healer_claim_mutex held --
+    see _claim_healer_cooldown's docstring."""
     try:
         raw = json.loads(_HEALER_SPAWN_MARKER.read_text(encoding="utf-8"))
         last = float(raw.get("ts", 0) or 0)
@@ -1315,8 +1413,8 @@ def _claim_healer_cooldown(now: float) -> bool:
             return False
         # Cooldown has expired: replace the stale marker atomically (a plain
         # os.replace, not exclusive-create, since we've established we're the
-        # rightful next claimant -- a competing claimant racing THIS exact
-        # instant would at worst cause one extra spawn, not corruption).
+        # rightful next claimant AND we hold the claim mutex, so no other caller
+        # can be mid-decision concurrently).
         # pid=0 is a placeholder -- spawn_server_healer() stamps the real PID
         # once Popen returns, since it isn't known at claim time.
         tmp = _HEALER_SPAWN_MARKER.with_suffix(".json.tmp")

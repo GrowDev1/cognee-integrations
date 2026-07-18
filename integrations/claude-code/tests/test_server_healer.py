@@ -426,6 +426,91 @@ def test_corrupt_marker_with_wrong_json_shape_also_self_heals():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_pid_alive_correctly_reports_a_genuinely_dead_pid_on_windows():
+    # 2026-07-18 adversarial-audit finding (CRITICAL): os.kill(pid, 0) on Windows does NOT
+    # detect death -- signal 0 maps to CTRL_C_EVENT there (GenerateConsoleCtrlEvent), not a
+    # liveness probe. Confirmed via 15/15 controlled trials (spawn, Popen.wait() to CONFIRM
+    # the OS has reaped it, then immediately check) that the old os.kill-based _pid_alive
+    # reported a definitively-dead PID as alive every single time. This is the real-process
+    # equivalent of test_healer_worker_inflight_ignores_a_marker_past_the_stale_window /
+    # test_inflight_check_unblocks_immediately_once_worker_exits above, which use synthetic
+    # data and predate this finding -- this test exercises the real OS-level check directly
+    # against a real spawned-and-reaped child, which is what actually caught the bug.
+    if sys.platform != "win32":
+        return  # this bug (and its fix) is Windows-specific; POSIX os.kill(pid,0) is correct
+    import subprocess
+
+    mismatches = 0
+    trials = 5
+    for _ in range(trials):
+        p = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+        p.wait(timeout=5)
+        if pc._pid_alive(p.pid):
+            mismatches += 1
+    assert mismatches == 0, (
+        f"_pid_alive incorrectly reported {mismatches}/{trials} genuinely-dead PIDs as alive "
+        "-- the Windows liveness fix has regressed"
+    )
+
+
+def test_claim_race_under_real_concurrency_produces_exactly_one_winner():
+    # 2026-07-18 adversarial-audit finding: the "marker exists, cooldown expired" branch of
+    # _claim_healer_cooldown used to read-then-later-write with NO lock between the two --
+    # forced the exact interleaving with real concurrent threads and got multiple winners.
+    # This drives many REAL concurrent threads through the full _claim_healer_cooldown path
+    # (not the already-covered "no marker yet" cold-start case) to prove the claim mutex
+    # actually serializes the steady-state "marker exists" path too.
+    import threading
+
+    tmp = _tmp_dir()
+    marker = tmp / "healer-spawned.json"
+    lock = tmp / "healer-claim.lock"
+    orig_marker = pc._HEALER_SPAWN_MARKER
+    orig_lock = pc._HEALER_CLAIM_LOCK
+    orig_cooldown = pc._HEALER_SPAWN_COOLDOWN_SECONDS
+    try:
+        pc._HEALER_SPAWN_MARKER = marker
+        pc._HEALER_CLAIM_LOCK = lock
+        # A REAL positive cooldown, not 0 -- with 0, "now - last < 0" is false for every
+        # claimant regardless of ordering, so even a perfectly-serialized (correctly mutexed)
+        # sequence would still show every claimant "winning", making the test unable to tell
+        # a working mutex apart from a broken one. ts=0 (epoch) makes the marker read as
+        # already-expired for the FIRST claimant; whichever thread's write lands first bumps
+        # ts to ~now, which must then correctly block every OTHER thread's read within the
+        # same 60s window -- that's the actual property under test.
+        pc._HEALER_SPAWN_COOLDOWN_SECONDS = 60.0
+        marker.write_text(json.dumps({"ts": 0.0, "pid": 0}), encoding="utf-8")
+
+        results = []
+        results_lock = threading.Lock()
+        barrier = threading.Barrier(15)
+
+        def worker():
+            barrier.wait()  # force maximum concurrent overlap on the critical section
+            now = time.time()
+            ok = pc._claim_healer_cooldown(now)
+            with results_lock:
+                results.append(ok)
+
+        threads = [threading.Thread(target=worker) for _ in range(15)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        wins = sum(1 for r in results if r)
+        assert wins == 1, f"race: {wins} of 15 concurrent claimants won simultaneously (expected exactly 1)"
+    finally:
+        pc._HEALER_SPAWN_MARKER = orig_marker
+        pc._HEALER_CLAIM_LOCK = orig_lock
+        pc._HEALER_SPAWN_COOLDOWN_SECONDS = orig_cooldown
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     failures = 0
     for _name, _fn in sorted(globals().items()):
