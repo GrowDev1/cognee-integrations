@@ -699,6 +699,41 @@ async def resolve_user(user_id: str):
     return await get_default_user()
 
 
+_LOG_MAX_BYTES = int(os.environ.get("COGNEE_PLUGIN_LOG_MAX_BYTES", "") or 20 * 1024 * 1024)  # 20MB
+
+
+def _rotate_log_if_large(path: Path, max_bytes: Optional[int] = None) -> None:
+    """Truncate-and-restart once a log exceeds max_bytes.
+
+    2026-07-18 finding: hook.log, healer.log, bootstrap.log, watcher.log, and
+    exit-watcher.log are all plain-append, never-rotated logs -- confirmed live at
+    healer.log=1.75GB and bootstrap.log=272MB, having grown unbounded since this
+    machine's earliest use of the plugin. Truncate-and-restart (not a numbered
+    archive) matches thessary/scripts/pipeline_sweep.py's own _log_event, whose
+    docstring already names these exact two files as "a direct lesson" -- these are
+    diagnostic tails, not an audit trail, so losing old content on rotation is
+    acceptable and simpler than managing archive files. Checked BEFORE opening for
+    append at every write site (cheap: one stat() call per write) rather than via a
+    separate periodic sweep, so growth is capped from the write site itself and
+    never depends on a scheduled task's cadence. Best-effort: a failed rotation
+    check must never block the write that's about to happen.
+
+    ``max_bytes`` defaults to ``None`` (re-read ``_LOG_MAX_BYTES`` fresh on every
+    call) rather than binding ``_LOG_MAX_BYTES`` as the parameter's default value --
+    a default argument value is evaluated ONCE at function-definition time, so
+    binding it directly would freeze in the module-load-time value forever,
+    silently ignoring any later reconfiguration (tests overriding
+    ``pc._LOG_MAX_BYTES``, or in principle a live env var change).
+    """
+    if max_bytes is None:
+        max_bytes = _LOG_MAX_BYTES
+    try:
+        if path.exists() and path.stat().st_size > max_bytes:
+            path.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def hook_log(event: str, detail: Optional[dict] = None) -> None:
     """Append one structured line to ~/.cognee-plugin/hook.log.
 
@@ -707,6 +742,7 @@ def hook_log(event: str, detail: Optional[dict] = None) -> None:
     """
     try:
         _HOOK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_log_if_large(_HOOK_LOG)
         line = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "pid": os.getpid(),
@@ -820,6 +856,7 @@ def notify(msg: str) -> None:
     if _verbose_enabled():
         try:
             _PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+            _rotate_log_if_large(_ACTIVITY_LOG)
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             with _ACTIVITY_LOG.open("a", encoding="utf-8") as fh:
                 fh.write(f"{ts} {line}\n")
@@ -1526,6 +1563,7 @@ def spawn_server_healer(cwd: str = "") -> bool:
                "agent_session_name": resolve_conn_uuid(get_session_key())}
     try:
         try:
+            _rotate_log_if_large(_HEALER_LOG)
             log_fh = _HEALER_LOG.open("a", encoding="utf-8")
         except Exception:
             log_fh = subprocess.DEVNULL
