@@ -21,7 +21,9 @@ import {
   hookLog,
   markServerReady,
   cacheApiKey,
-  resolveApiKey,
+  resolveApiKeyFromConfig,
+  resolveLlmApiKey,
+  resolveBaseUrl,
   isLocalUrl,
   touchActivity,
 } from "../src/plugin-common.ts";
@@ -173,27 +175,41 @@ export default async function init(ctx: InitContext): Promise<void> {
   // Persist the resolved config so the runtime hooks (which read the state
   // file via loadConfig) operate on the same values init resolved.
   saveConfig(cfg);
+
+  // If the config didn't specify an explicit base_url (i.e. we're still
+  // on the local default), check the credential store for a base_url
+  // override. This enables Option B: set cognee:base_url credential and
+  // skip the config.json step entirely.
+  if (!fromContext || !("base_url" in (ctx.config as object ?? {}))) {
+    const credUrl = await resolveBaseUrl(cfg);
+    if (credUrl) {
+      cfg.baseUrl = credUrl.replace(/\/+$/, "");
+      cfg.mode = isLocalUrl(cfg.baseUrl) ? "local" : "cloud";
+      saveConfig(cfg);
+      hookLog("init_base_url_from_credential", { baseUrl: cfg.baseUrl, mode: cfg.mode });
+    }
+  }
+
   const { baseUrl } = cfg;
   hookLog("init_config", {
-    managed: cfg.managed,
     mode: cfg.mode,
     baseUrl,
     fromContext,
     warnings: warnings.length,
   });
 
-  // 3. Bring up (managed) or locate (remote) the backend.
+  // 3. Bring up (local) or locate (remote) the backend.
   let reachable: boolean;
-  if (cfg.managed) {
+  if (cfg.mode === "local") {
     // The plugin owns the lifecycle: provision a venv if needed and spawn it.
     reachable = await ensureLocalServer(cfg, ctx.logger);
   } else {
     reachable = await backendReachable(baseUrl);
   }
   if (!reachable) {
-    hookLog("init_backend_unreachable", { baseUrl, managed: cfg.managed });
+    hookLog("init_backend_unreachable", { baseUrl, mode: cfg.mode });
     ctx.logger.warn(
-      { baseUrl, managed: cfg.managed },
+      { baseUrl, mode: cfg.mode },
       "cognee backend not reachable — memory hooks will be no-ops until it comes up",
     );
     // Don't fail init — the backend may come up later.
@@ -202,9 +218,19 @@ export default async function init(ctx: InitContext): Promise<void> {
   }
 
   // 4. Resolve or mint the API key.
-  let apiKey = resolveApiKey(baseUrl);
+  let apiKey = await resolveApiKeyFromConfig(cfg);
   if (!apiKey && reachable && isLocalUrl(baseUrl)) {
     apiKey = await mintApiKey(baseUrl);
+  }
+  if (!apiKey && reachable && cfg.mode === "local") {
+    // Cognee 1.3+ with ENABLE_BACKEND_ACCESS_CONTROL=false (which we set
+    // for local servers) accepts all requests without auth. Minting may
+    // fail because the login endpoint changed in 1.3, but the server works
+    // without a key. Cache a sentinel so the runtime hooks don't skip.
+    apiKey = "local-no-auth";
+    cacheApiKey(apiKey, baseUrl);
+    process.env.COGNEE_API_KEY = apiKey;
+    hookLog("init_local_no_auth", { baseUrl });
   }
   if (!apiKey) {
     hookLog("init_no_api_key", { baseUrl });
@@ -220,19 +246,36 @@ export default async function init(ctx: InitContext): Promise<void> {
   }
 
   // 6. Check if the server has an LLM API key configured.
-  // Without it, graph sync (/api/v1/remember) will fail with
-  // LLMAPIKeyNotSetError. Session cache (/api/v1/remember/entry) works fine.
+  // This is the key the Cognee server uses for its cognify pipeline (graph
+  // sync). In local mode, we pass COGNEE_LLM_API_KEY through to the spawned
+  // server process. In cloud/server mode, it must be configured on the server.
+  // Without it, graph sync will fail with LLMAPIKeyNotSetError. Session
+  // memory (QA pairs, traces) still works without it.
   if (reachable && apiKey) {
-    const hasLlmKey = await checkLlmKey(baseUrl, apiKey);
-    if (hasLlmKey === false) {
-      hookLog("init_no_llm_key", { baseUrl });
+    const llmKey = await resolveLlmApiKey(cfg);
+    if (!llmKey && cfg.mode === "local") {
+      hookLog("init_no_llm_key", { baseUrl, mode: cfg.mode });
       ctx.logger.warn(
-        { baseUrl },
-        "cognee server has no LLM API key configured — session-to-graph sync will fail " +
-          "until one is set. Session memory (QA pairs, traces) still works. " +
-          "Set an LLM key on the cognee server via POST /api/v1/settings or " +
-          "the LLM_API_KEY env var on the server process.",
+        { baseUrl, llmApiKeyCredential: cfg.llmApiKeyCredential || "(not set)" },
+        "no LLM API key for local cognee server — set llm_api_key_credential " +
+          "in config (e.g. \"openai:api_key\") or export COGNEE_LLM_API_KEY. " +
+          "Graph sync will fail without it. Session memory still works.",
       );
+    } else if (!llmKey) {
+      // Remote server — check if it has an LLM key configured.
+      const hasLlmKey = await checkLlmKey(baseUrl, apiKey);
+      if (hasLlmKey === false) {
+        hookLog("init_no_llm_key", { baseUrl, mode: cfg.mode });
+        ctx.logger.warn(
+          { baseUrl },
+          "cognee server has no LLM API key configured — graph sync will fail " +
+            "until one is set. Session memory (QA pairs, traces) still works. " +
+            "Set an LLM key on the cognee server via POST /api/v1/settings or " +
+            "the COGNEE_LLM_API_KEY env var on the server process.",
+        );
+      }
+    } else {
+      hookLog("init_llm_key_resolved", { mode: cfg.mode });
     }
   }
 
