@@ -1114,14 +1114,15 @@ def _session_start_guidance(mode: str, dataset: str, session_id: str, ready: boo
 
 
 def _ensure_statusline_configured() -> None:
-    """Write the statusLine entry to ~/.claude/settings.json when we own the slot.
+    """Write the statusLine entry to ~/.claude/settings.json when safe.
 
     Claude Code hot-reloads settings.json, so the status line becomes active on
-    the next status refresh without requiring a restart. A pre-existing custom
-    statusLine is preserved — settings.json is global user config, and seizing
-    the key on every SessionStart would clobber the user's own status line with
-    no way to restore it.
+    the next status refresh without requiring a restart.
     """
+    if os.environ.get("COGNEE_STATUSLINE", "").lower() in {"0", "false", "no", "off"}:
+        hook_log("statusline_setup_skipped", {"reason": "disabled_by_env"})
+        return
+
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
     if plugin_root:
         statusline_sh = Path(plugin_root) / "scripts" / "cognee-statusline.sh"
@@ -1154,11 +1155,14 @@ def _ensure_statusline_configured() -> None:
         existing = settings.get("statusLine")
         if existing == desired:
             return
-        if existing:
-            existing_cmd = existing.get("command", "") if isinstance(existing, dict) else ""
-            if "cognee-statusline.sh" not in existing_cmd:
-                hook_log("statusline_preserved_user_owned", {})
-                return
+
+        existing_command = existing.get("command") if isinstance(existing, dict) else None
+        is_cognee_owned = (
+            isinstance(existing_command, str) and "cognee-statusline.sh" in existing_command
+        )
+        if existing and not is_cognee_owned:
+            hook_log("statusline_setup_skipped", {"reason": "user_statusline_exists"})
+            return
 
         settings["statusLine"] = desired
         settings_path.parent.mkdir(parents=True, exist_ok=True)

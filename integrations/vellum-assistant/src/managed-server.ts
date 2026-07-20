@@ -1,7 +1,7 @@
 /**
  * Managed Cognee server lifecycle.
  *
- * When the plugin owns the server (`config.managed === true`), the init hook
+ * When the plugin owns the server (`config.mode === "local"`), the init hook
  * calls `ensureLocalServer` to bring a local Cognee server up before the
  * memory hooks run. The flow is:
  *
@@ -29,6 +29,7 @@ import {
   writeServerPid,
   serverLogPath,
   pluginStateDir,
+  resolveLlmApiKey,
 } from "./plugin-common.ts";
 import { backendReachable } from "./cognee-client.ts";
 
@@ -139,16 +140,37 @@ async function ensureVenv(
     }
   }
 
-  // Install (or repair) cognee into the venv.
-  logger.info({ venvDir: spec.venvDir }, "installing cognee into managed venv");
+  // Ensure pip is available in the venv. Some base images (e.g. Debian
+  // without python3-pip) create venvs without pip. Bootstrap it via
+  // get-pip.py if the venv python can't import pip.
+  const pipCheck = await run([py, "-c", "import pip"], { timeoutMs: 10_000 });
+  if (!pipCheck.ok) {
+    logger.info({ venvDir: spec.venvDir }, "pip not found in venv — bootstrapping via get-pip.py");
+    const bootstrapped = await run(
+      [py, "-c", "import urllib.request, sys; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py'); import subprocess; sys.exit(subprocess.call([sys.executable, '/tmp/get-pip.py']))"],
+      { timeoutMs: 120_000 },
+    );
+    if (!bootstrapped.ok) {
+      logger.error(
+        { output: bootstrapped.output },
+        "pip bootstrap failed — managed server unavailable",
+      );
+      hookLog("managed_pip_bootstrap_failed", { output: bootstrapped.output });
+      return false;
+    }
+  }
+
+  // Install (or repair) cognee + uvicorn into the venv. Cognee 1.3+ may
+  // not pull uvicorn as a dependency, so install it explicitly.
+  logger.info({ venvDir: spec.venvDir }, "installing cognee + uvicorn into managed venv");
   const pip = await run(
-    [py, "-m", "pip", "install", "--upgrade", "cognee"],
+    [py, "-m", "pip", "install", "--upgrade", "cognee", "uvicorn"],
     { timeoutMs: PROVISION_TIMEOUT_MS },
   );
   if (!pip.ok) {
     logger.error(
       { output: pip.output },
-      "pip install cognee failed — managed server unavailable",
+      "pip install cognee+uvicorn failed — managed server unavailable",
     );
     hookLog("managed_pip_install_failed", { output: pip.output });
     return false;
@@ -238,7 +260,7 @@ export async function ensureLocalServer(
       { configured: cfg.server.python },
       "no Python interpreter found — cannot start managed cognee server. " +
         "Install Python 3.12+, set config.server.python to its path, or point " +
-        "the plugin at a remote server (set managed=false + base_url).",
+        "the plugin at a remote server (set mode=cloud + base_url).",
     );
     hookLog("managed_no_python", { configured: cfg.server.python });
     return false;
@@ -248,8 +270,11 @@ export async function ensureLocalServer(
   const ready = await ensureVenv(python, cfg.server, logger);
   if (!ready) return false;
 
-  // 4. Spawn the server.
-  const pid = spawnServer(cfg.server, logger);
+  // 4. Spawn the server, passing the LLM API key through to the server env.
+  const llmKey = await resolveLlmApiKey(cfg);
+  const serverEnv = { ...cfg.server.env };
+  if (llmKey) serverEnv.COGNEE_LLM_API_KEY = llmKey;
+  const pid = spawnServer({ ...cfg.server, env: serverEnv }, logger);
   if (!pid) return false;
 
   // 5. Wait for it to answer the healthcheck.
