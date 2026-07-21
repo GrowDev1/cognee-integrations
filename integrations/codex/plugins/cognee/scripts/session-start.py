@@ -44,6 +44,8 @@ from _plugin_common import (
     set_session_key,
     touch_activity,
 )
+from _proc import find_host_ancestor_windows
+from _proc import pid_alive as _pid_alive
 from cognee_statusline_render import render_status_for_host
 from config import (
     _cloud_http_request,
@@ -458,20 +460,6 @@ def _ensure_local_server_running(
                 hook_log("server_bootstrap_lock_release_failed", {"error": str(exc)[:200]})
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 1:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
-
-
 def _normalize_service_url(service_url: str) -> str:
     return str(service_url or "").strip().rstrip("/")
 
@@ -609,10 +597,9 @@ def _watcher_alive() -> bool:
         return False
     try:
         pid = int(_WATCHER_PID.read_text(encoding="utf-8").strip())
-        os.kill(pid, 0)
-        return True
     except Exception:
         return False
+    return _pid_alive(pid)
 
 
 def _spawn_idle_watcher(
@@ -682,6 +669,8 @@ def _spawn_idle_watcher(
 def _find_codex_parent_pid() -> int:
     """Find the nearest live Codex ancestor, skipping hook shells."""
     fallback = os.getppid()
+    if sys.platform == "win32":
+        return find_host_ancestor_windows(fallback, "codex")
     try:
         raw = subprocess.check_output(
             ["ps", "-axo", "pid=,ppid=,command="],
@@ -731,19 +720,6 @@ def _spawn_exit_watcher(
     service_url: str = "",
 ) -> None:
     """Launch a detached watcher that syncs only after Codex exits."""
-
-    def _pid_alive(pid: int) -> bool:
-        if pid <= 1:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except Exception:
-            return False
 
     # Cleanup stale watcher pidfiles so the directory does not grow forever.
     try:
