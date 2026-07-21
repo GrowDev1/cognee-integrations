@@ -23,8 +23,18 @@ jobs:
   test-plugins-windows:
     runs-on: windows-latest
     steps:
+      # The repo has deeply-nested committed artifacts (n8n_workflows LanceDB
+      # files) whose paths exceed Windows' MAX_PATH; sparse-checkout the plugin
+      # trees this job needs and allow long paths so checkout cannot break.
+      - name: Allow long paths for checkout
+        run: git config --global core.longpaths true
+
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            integrations/claude-code
+            integrations/codex
 
       - name: Set up Python
         uses: actions/setup-python@v5
