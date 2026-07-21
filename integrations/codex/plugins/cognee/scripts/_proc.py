@@ -44,6 +44,10 @@ def _pid_alive_posix(pid: int) -> bool:
 
 
 def _pid_alive_windows(pid: int) -> bool:
+    if pid > 0xFFFFFFFF:
+        # A Windows PID is a DWORD; a larger value (e.g. from a corrupt pidfile)
+        # is not a real process and would otherwise truncate into DWORD range.
+        return False
     # ``os.kill(pid, 0)`` raises WinError 87 here (signal 0 is unsupported), so
     # probe via a process handle instead. OpenProcess fails with
     # ERROR_ACCESS_DENIED for a live process we may not synchronise on (e.g. a
